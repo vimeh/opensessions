@@ -11,7 +11,7 @@ use crate::tmux_scripting::{
 };
 
 const SEP: &str = "\t";
-const STASH_SESSION: &str = "_os_stash";
+pub(crate) const STASH_SESSION: &str = "_os_stash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -52,6 +52,43 @@ impl Default for StdCommandRunner {
 impl CommandRunner for StdCommandRunner {
     fn run(&self, args: &[String]) -> CommandOutput {
         match Command::new(&self.binary).args(args).output() {
+            Ok(output) => CommandOutput {
+                exit_code: output.status.code().unwrap_or(1),
+                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            },
+            Err(err) => CommandOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: err.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SocketCommandRunner {
+    binary: String,
+    socket_path: String,
+}
+
+impl SocketCommandRunner {
+    pub fn new(binary: impl Into<String>, socket_path: impl Into<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            socket_path: socket_path.into(),
+        }
+    }
+}
+
+impl CommandRunner for SocketCommandRunner {
+    fn run(&self, args: &[String]) -> CommandOutput {
+        match Command::new(&self.binary)
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(args)
+            .output()
+        {
             Ok(output) => CommandOutput {
                 exit_code: output.status.code().unwrap_or(1),
                 stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -134,8 +171,18 @@ impl TmuxClient {
         self.runner.run(&args)
     }
 
+    pub fn try_list_sessions(&self) -> Option<Vec<SessionInfo>> {
+        let output = self.run(&["list-sessions", "-F", session_format()]);
+        output.ok().then(|| parse_sessions(&output.stdout))
+    }
+
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
         parse_sessions(&self.run(&["list-sessions", "-F", session_format()]).stdout)
+    }
+
+    pub fn try_list_windows(&self) -> Option<Vec<WindowInfo>> {
+        let output = self.run(&["list-windows", "-a", "-F", window_format()]);
+        output.ok().then(|| parse_windows(&output.stdout))
     }
 
     pub fn list_windows(&self) -> Vec<WindowInfo> {
@@ -146,8 +193,33 @@ impl TmuxClient {
         )
     }
 
+    pub fn try_list_clients(&self) -> Option<Vec<ClientInfo>> {
+        let output = self.run(&["list-clients", "-F", client_format()]);
+        output.ok().then(|| parse_clients(&output.stdout))
+    }
+
     pub fn list_clients(&self) -> Vec<ClientInfo> {
         parse_clients(&self.run(&["list-clients", "-F", client_format()]).stdout)
+    }
+
+    pub fn try_list_panes(&self, scope: PaneScope<'_>) -> Option<Vec<PaneInfo>> {
+        let mut args = vec!["list-panes"];
+        match scope {
+            PaneScope::All => args.push("-a"),
+            PaneScope::Session(target) => {
+                args.push("-s");
+                args.push("-t");
+                args.push(target);
+            }
+            PaneScope::Window(target) => {
+                args.push("-t");
+                args.push(target);
+            }
+        }
+        args.push("-F");
+        args.push(pane_format());
+        let output = self.run(&args);
+        output.ok().then(|| parse_panes(&output.stdout))
     }
 
     pub fn list_panes(&self, scope: PaneScope<'_>) -> Vec<PaneInfo> {
@@ -1065,5 +1137,69 @@ mod tests {
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
         );
+    }
+
+    /// Executable helper script on disk, removed on drop.
+    struct TempScript {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn write_script(label: &str, contents: &str) -> TempScript {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "opensessions-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write helper script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("mark helper script executable");
+        TempScript { path }
+    }
+
+    #[test]
+    fn socket_runner_prefixes_socket_flag_and_maps_streams_and_exit_code() {
+        let script = write_script(
+            "socket-runner-argv",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'boom' >&2\nexit 3\n",
+        );
+        let runner = SocketCommandRunner::new(
+            script.path.to_str().expect("utf-8 script path"),
+            "/tmp/inner-tmux-test.sock",
+        );
+
+        let output = runner.run(&[
+            "list-sessions".to_string(),
+            "-F".to_string(),
+            "#{session_name}".to_string(),
+        ]);
+
+        assert_eq!(
+            output.stdout,
+            "-S\n/tmp/inner-tmux-test.sock\nlist-sessions\n-F\n#{session_name}",
+        );
+        assert_eq!(output.stderr, "boom");
+        assert_eq!(output.exit_code, 3);
+        assert!(!output.ok());
+    }
+
+    #[test]
+    fn socket_runner_surfaces_spawn_failure_as_failed_output() {
+        let runner = SocketCommandRunner::new(
+            "/nonexistent/opensessions-tmux-binary",
+            "/tmp/inner-tmux-test.sock",
+        );
+
+        let output = runner.run(&["list-sessions".to_string()]);
+
+        assert!(!output.ok());
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
     }
 }

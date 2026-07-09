@@ -9,6 +9,7 @@ pub mod pi_runtime_registry;
 pub mod port_discovery;
 pub mod portless;
 pub mod project_dir_session;
+pub mod remote_tmux_provider;
 pub mod protocol;
 pub mod server_state;
 pub mod session_order;

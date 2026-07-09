@@ -455,6 +455,7 @@ dependencies = [
 name = "opensessions-runtime"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
  "serde_json",
 ]
@@ -468,6 +469,7 @@ dependencies = [
  "http",
  "opensessions-runtime",
  "opensessions-sidebar-core",
+ "parking_lot",
  "serde_json",
  "sha1_smol",
  "tokio",

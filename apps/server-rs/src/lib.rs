@@ -28,6 +28,7 @@ use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_
 use opensessions_runtime::project_dir_session::{
     build_dir_session_map, resolve_session_for_project_dir,
 };
+use opensessions_runtime::remote_tmux_provider::RemoteTmuxProvider;
 use opensessions_runtime::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
     SessionFilterMode,
@@ -370,8 +371,11 @@ pub fn default_state_source_from_env(
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<ReadOnlyMuxStateSource> {
     if env("TMUX").is_some() {
-        let provider = Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default())));
-        let mut source = ReadOnlyMuxStateSource::new(vec![provider]);
+        let providers: Vec<Arc<dyn MuxProvider>> = vec![
+            Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default()))),
+            Arc::new(RemoteTmuxProvider::default()),
+        ];
+        let mut source = ReadOnlyMuxStateSource::new(providers);
         let config = env("HOME")
             .map(PathBuf::from)
             .map(|home| load_config_from_home(&home));
@@ -745,7 +749,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                provider.switch_session(name, client_tty);
+                self.provider_for_session(name)?.switch_session(name, client_tty);
                 None
             }
             "switch-index" => {
@@ -754,15 +758,15 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "kill-session" => {
                 let name = command.get("name")?.as_str()?;
-                if provider.get_current_session().as_deref() == Some(name)
+                if self.provider_for_session(name)?.get_current_session().as_deref() == Some(name)
                     && let Some(next) = self
                         .session_before(name)
                         .or_else(|| self.session_after(name))
                 {
-                    provider.switch_session(&next, None);
+                    self.provider_for_session(&next)?.switch_session(&next, None);
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
-                provider.kill_session(name);
+                self.provider_for_session(name)?.kill_session(name);
                 Some(self.snapshot_json())
             }
             "hide-session" => {
@@ -1591,11 +1595,11 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
-        let provider = self.providers.first()?;
         let target_index = index.checked_sub(1).map(|index| index as usize)?;
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
+        let provider = self.provider_for_session(&name)?;
         provider.switch_session(&name, client_tty);
         None
     }
@@ -3018,4 +3022,166 @@ fn clamp_detail_panel_height(height: u16) -> u16 {
 
 fn parse_command(message: &Message) -> Option<Value> {
     serde_json::from_str::<Value>(message.as_text()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opensessions_runtime::mux::MuxSessionInfo;
+    use parking_lot::Mutex as PlMutex;
+
+    struct FakeProvider {
+        provider_name: &'static str,
+        sessions: Vec<&'static str>,
+        switched: PlMutex<Vec<(String, Option<String>)>>,
+        killed: PlMutex<Vec<String>>,
+    }
+
+    impl FakeProvider {
+        fn new(provider_name: &'static str, sessions: Vec<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                provider_name,
+                sessions,
+                switched: PlMutex::new(Vec::new()),
+                killed: PlMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl MuxProvider for FakeProvider {
+        fn name(&self) -> &str {
+            self.provider_name
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            self.sessions
+                .iter()
+                .map(|name| MuxSessionInfo {
+                    name: (*name).to_string(),
+                    created_at: 0,
+                    dir: String::new(),
+                    windows: 1,
+                })
+                .collect()
+        }
+
+        fn switch_session(&self, name: &str, client_tty: Option<&str>) {
+            self.switched
+                .lock()
+                .push((name.to_string(), client_tty.map(str::to_string)));
+        }
+
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            0
+        }
+
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+
+        fn kill_session(&self, name: &str) {
+            self.killed.lock().push(name.to_string());
+        }
+
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+
+        fn cleanup_hooks(&self) {}
+    }
+
+    struct NoPorts;
+
+    impl PortCommandRunner for NoPorts {
+        fn process_rows(&self) -> Vec<(u32, u32)> {
+            Vec::new()
+        }
+
+        fn lsof_fields(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct NoGit;
+
+    impl GitCommandRunner for NoGit {
+        fn git_info_output(&self, _dir: &str) -> String {
+            String::new()
+        }
+    }
+
+    fn source_with(providers: Vec<Arc<dyn MuxProvider>>) -> ReadOnlyMuxStateSource {
+        ReadOnlyMuxStateSource::new(providers)
+            .with_port_command_runner(Arc::new(NoPorts))
+            .with_git_command_runner(Arc::new(NoGit))
+            .with_now_ms(|| 0)
+    }
+
+    #[test]
+    fn provider_for_session_routes_by_session_listing_with_local_fallback() {
+        let local = FakeProvider::new("tmux", vec!["agents"]);
+        let remote = FakeProvider::new("tmux-remote", vec!["web-1/main"]);
+        let source = source_with(vec![local, remote]);
+
+        assert_eq!(
+            source.provider_for_session("agents").expect("provider").name(),
+            "tmux",
+        );
+        assert_eq!(
+            source
+                .provider_for_session("web-1/main")
+                .expect("provider")
+                .name(),
+            "tmux-remote",
+        );
+        // Sessions no provider lists (races with kills, stale sidebar rows)
+        // still route to the primary local provider instead of dropping the
+        // command.
+        assert_eq!(
+            source.provider_for_session("ghost").expect("provider").name(),
+            "tmux",
+        );
+    }
+
+    #[test]
+    fn switch_session_command_reaches_the_owning_provider() {
+        let local = FakeProvider::new("tmux", vec!["agents"]);
+        let remote = FakeProvider::new("tmux-remote", vec!["web-1/main"]);
+        let source = source_with(vec![local.clone(), remote.clone()]);
+
+        source.handle_client_command(&serde_json::json!({
+            "type": "switch-session",
+            "name": "web-1/main",
+            "clientTty": "/dev/ttys009",
+        }));
+
+        assert_eq!(
+            remote.switched.lock().as_slice(),
+            &[("web-1/main".to_string(), Some("/dev/ttys009".to_string()))],
+        );
+        assert!(local.switched.lock().is_empty());
+    }
+
+    #[test]
+    fn kill_session_command_reaches_the_owning_provider() {
+        let local = FakeProvider::new("tmux", vec!["agents"]);
+        let remote = FakeProvider::new("tmux-remote", vec!["web-1/main"]);
+        let source = source_with(vec![local.clone(), remote.clone()]);
+
+        source.handle_client_command(&serde_json::json!({
+            "type": "kill-session",
+            "name": "web-1/main",
+        }));
+
+        assert_eq!(remote.killed.lock().as_slice(), &["web-1/main".to_string()]);
+        assert!(local.killed.lock().is_empty());
+    }
 }
