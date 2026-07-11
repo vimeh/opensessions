@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
@@ -66,38 +68,129 @@ impl CommandRunner for StdCommandRunner {
     }
 }
 
+/// Runs tmux against an explicit server socket (`tmux -S <socket> ...`).
+///
+/// Unlike the local runner, every invocation is bounded by a deadline: these
+/// sockets are typically ssh-forwarded to another machine, and a dead-but-
+/// established ssh transport (dropped network, roaming laptop) accepts the
+/// unix connect and then never replies. Without the deadline a single hung
+/// forward would block the synchronous MuxProvider call and wedge the whole
+/// server poll loop. On expiry the child is killed and the command reports
+/// failure (exit code 124), which callers treat as "host unavailable".
 #[derive(Debug, Clone)]
 pub struct SocketCommandRunner {
     binary: String,
     socket_path: String,
+    timeout: Duration,
 }
+
+const SOCKET_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl SocketCommandRunner {
     pub fn new(binary: impl Into<String>, socket_path: impl Into<String>) -> Self {
+        Self::with_timeout(binary, socket_path, SOCKET_COMMAND_TIMEOUT)
+    }
+
+    pub fn with_timeout(
+        binary: impl Into<String>,
+        socket_path: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             binary: binary.into(),
             socket_path: socket_path.into(),
+            timeout,
         }
     }
 }
 
+fn drain_pipe(pipe: Option<impl std::io::Read + Send + 'static>) -> JoinHandle<String> {
+    thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    })
+}
+
+/// Kill the child and everything it spawned. A plain `Child::kill` signals
+/// only the direct child; any grandchild inheriting our stdout/stderr pipes
+/// would keep the drain threads (and this call) alive past the deadline.
+/// The child is spawned as its own process group leader, so signalling the
+/// negative pgid reaps the whole tree.
+fn kill_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl CommandRunner for SocketCommandRunner {
     fn run(&self, args: &[String]) -> CommandOutput {
-        match Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .arg("-S")
             .arg(&self.socket_path)
             .args(args)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
         {
-            Ok(output) => CommandOutput {
-                exit_code: output.status.code().unwrap_or(1),
-                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                return CommandOutput {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: err.to_string(),
+                };
+            }
+        };
+
+        // Drain pipes on threads so a chatty child cannot block on a full
+        // pipe while we poll for exit; after the group kill every writer is
+        // gone, so the drains see EOF and the joins below return promptly.
+        let stdout_handle = drain_pipe(child.stdout.take());
+        let stderr_handle = drain_pipe(child.stderr.take());
+
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    kill_child_group(&mut child);
+                    break None;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    kill_child_group(&mut child);
+                    break None;
+                }
+            }
+        };
+
+        let stdout = stdout_handle.join().unwrap_or_default();
+        let stderr = stderr_handle.join().unwrap_or_default();
+        match status {
+            Some(status) => CommandOutput {
+                exit_code: status.code().unwrap_or(1),
+                stdout: stdout.trim().to_string(),
+                stderr: stderr.trim().to_string(),
             },
-            Err(err) => CommandOutput {
-                exit_code: 1,
+            None => CommandOutput {
+                exit_code: 124,
                 stdout: String::new(),
-                stderr: err.to_string(),
+                stderr: format!(
+                    "tmux -S {} timed out after {:?}",
+                    self.socket_path, self.timeout
+                ),
             },
         }
     }
@@ -1096,7 +1189,7 @@ fn parse_u64(parts: &[&str], index: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     #[derive(Default)]
     struct RecordingRunner {
@@ -1105,7 +1198,7 @@ mod tests {
 
     impl CommandRunner for RecordingRunner {
         fn run(&self, args: &[String]) -> CommandOutput {
-            self.calls.lock().unwrap().push(args.to_vec());
+            self.calls.lock().push(args.to_vec());
             CommandOutput {
                 exit_code: 0,
                 stdout: "/dev/ttys001\topensessions\t@0\t%186".to_string(),
@@ -1128,7 +1221,7 @@ mod tests {
         assert_eq!(focus.window_id, "@0");
         assert_eq!(focus.pane_id, "%186");
         assert_eq!(
-            runner.calls.lock().unwrap()[0],
+            runner.calls.lock()[0],
             vec![
                 "display-message".to_string(),
                 "-c".to_string(),
@@ -1151,15 +1244,34 @@ mod tests {
     }
 
     fn write_script(label: &str, contents: &str) -> TempScript {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+
         let path = std::env::temp_dir().join(format!(
             "opensessions-{label}-{}",
             std::process::id()
         ));
-        std::fs::write(&path, contents).expect("write helper script");
+        let mut file = std::fs::File::create(&path).expect("create helper script");
+        file.write_all(contents.as_bytes())
+            .expect("write helper script");
+        drop(file);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("mark helper script executable");
         TempScript { path }
+    }
+
+    fn run_script_with_retry(runner: &SocketCommandRunner, args: &[String]) -> CommandOutput {
+        for attempt in 0..5 {
+            let output = runner.run(args);
+            if output.exit_code != 1
+                || !output.stderr.contains("Text file busy")
+                || attempt == 4
+            {
+                return output;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        unreachable!()
     }
 
     #[test]
@@ -1173,11 +1285,14 @@ mod tests {
             "/tmp/inner-tmux-test.sock",
         );
 
-        let output = runner.run(&[
-            "list-sessions".to_string(),
-            "-F".to_string(),
-            "#{session_name}".to_string(),
-        ]);
+        let output = run_script_with_retry(
+            &runner,
+            &[
+                "list-sessions".to_string(),
+                "-F".to_string(),
+                "#{session_name}".to_string(),
+            ],
+        );
 
         assert_eq!(
             output.stdout,
@@ -1185,6 +1300,78 @@ mod tests {
         );
         assert_eq!(output.stderr, "boom");
         assert_eq!(output.exit_code, 3);
+        assert!(!output.ok());
+    }
+
+    #[test]
+    fn socket_runner_deadline_kills_child() {
+        let script = write_script(
+            "socket-runner-timeout",
+            "#!/bin/sh\nexec sleep 5\n",
+        );
+        let socket_path = "/tmp/inner-tmux-timeout-test.sock";
+        let timeout = Duration::from_millis(100);
+        let runner = SocketCommandRunner::with_timeout(
+            script.path.to_str().expect("utf-8 script path"),
+            socket_path,
+            timeout,
+        );
+
+        let started = Instant::now();
+        let output = run_script_with_retry(&runner, &["list-sessions".to_string()]);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < timeout * 10,
+            "timed-out child should be killed promptly; elapsed {elapsed:?}"
+        );
+        assert_eq!(output.exit_code, 124);
+        assert!(!output.ok());
+        assert!(output.stderr.contains(socket_path), "{}", output.stderr);
+        assert!(output.stderr.contains("100ms"), "{}", output.stderr);
+    }
+
+    #[test]
+    fn socket_runner_deadline_preserves_fast_child_output_and_exit_code() {
+        let script = write_script(
+            "socket-runner-fast",
+            "#!/bin/sh\nprintf 'first line\\nsecond line without newline'\nexit 7\n",
+        );
+        let runner = SocketCommandRunner::with_timeout(
+            script.path.to_str().expect("utf-8 script path"),
+            "/tmp/inner-tmux-fast-test.sock",
+            Duration::from_secs(1),
+        );
+
+        let output = run_script_with_retry(&runner, &["list-sessions".to_string()]);
+
+        assert_eq!(output.stdout, "first line\nsecond line without newline");
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.exit_code, 7);
+        assert!(!output.ok());
+    }
+
+    #[test]
+    fn socket_runner_deadline_drains_output_before_kill() {
+        let script = write_script(
+            "socket-runner-timeout-output",
+            "#!/bin/sh\nprintf 'stdout before timeout\\n'\nprintf 'stderr before timeout\\n' >&2\nsleep 5\n",
+        );
+        let timeout = Duration::from_millis(100);
+        let runner = SocketCommandRunner::with_timeout(
+            script.path.to_str().expect("utf-8 script path"),
+            "/tmp/inner-tmux-timeout-output-test.sock",
+            timeout,
+        );
+
+        let started = Instant::now();
+        let output = run_script_with_retry(&runner, &["list-sessions".to_string()]);
+
+        assert!(
+            started.elapsed() < timeout * 10,
+            "pipe draining should complete promptly after kill"
+        );
+        assert_eq!(output.exit_code, 124);
         assert!(!output.ok());
     }
 
