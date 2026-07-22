@@ -26,7 +26,7 @@ use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
-    build_dir_session_map, resolve_session_for_project_dir,
+    build_dir_session_map, has_candidates_for_project_dir, resolve_session_for_project_dir,
 };
 use opensessions_runtime::remote_tmux_provider::RemoteTmuxProvider;
 use opensessions_runtime::protocol::{
@@ -178,7 +178,7 @@ pub trait StateSource: Send + Sync + 'static {
         Err(PiRuntimeError::InvalidPayload)
     }
 
-    fn handle_pi_runtime_delete(&self, _body: &Value) -> Result<(), PiRuntimeError> {
+    fn handle_pi_runtime_delete(&self, _body: &Value) -> Result<Option<String>, PiRuntimeError> {
         Err(PiRuntimeError::MissingPid)
     }
 
@@ -637,6 +637,9 @@ impl StateSource for ReadOnlyMuxStateSource {
     fn snapshot_json(&self) -> String {
         self.sync_agent_pane_presence();
         self.mark_focused_agent_panes_seen();
+        // Reap terminal agent entries past their TTL so closed agents drop
+        // out of the agents tab without manual dismissal.
+        self.agent_tracker.lock().unwrap().prune_terminal();
 
         let providers = self
             .providers
@@ -890,6 +893,17 @@ impl StateSource for ReadOnlyMuxStateSource {
                 }
                 None
             }
+            "dismiss-agent" => {
+                let session = command.get("session")?.as_str()?;
+                let agent = command.get("agent")?.as_str()?;
+                let thread_id = command.get("threadId").and_then(Value::as_str);
+                let dismissed = self
+                    .agent_tracker
+                    .lock()
+                    .unwrap()
+                    .dismiss(session, agent, thread_id);
+                dismissed.then(|| self.snapshot_json())
+            }
             _ => None,
         }
     }
@@ -1026,14 +1040,27 @@ impl StateSource for ReadOnlyMuxStateSource {
         Ok(())
     }
 
-    fn handle_pi_runtime_delete(&self, body: &Value) -> Result<(), PiRuntimeError> {
+    fn handle_pi_runtime_delete(&self, body: &Value) -> Result<Option<String>, PiRuntimeError> {
         let pid = body
             .get("pid")
             .and_then(Value::as_u64)
             .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
             .ok_or(PiRuntimeError::MissingPid)? as u32;
-        self.pi_runtime_registry.lock().unwrap().delete(pid);
-        Ok(())
+        let removed = self.pi_runtime_registry.lock().unwrap().delete(pid);
+        let Some(info) = removed else {
+            return Ok(None);
+        };
+        // A clean pi exit is the authoritative "this agent is closed" signal;
+        // drop its tracker entry so the agents tab doesn't keep a ghost.
+        let dismissed = self
+            .resolve_session_for_project_dir_local_first(&info.cwd)
+            .is_some_and(|session| {
+                self.agent_tracker
+                    .lock()
+                    .unwrap()
+                    .dismiss(&session, "pi", Some(&info.session_id))
+            });
+        Ok(dismissed.then(|| self.snapshot_json()))
     }
 
     fn handle_http_text(&self, path: &str, body: &str) -> Option<String> {
@@ -1227,49 +1254,64 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn resolve_agent_watcher_session(&self, snapshot: &AgentWatcherSnapshot) -> Option<String> {
-        let sessions = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .collect::<Vec<_>>();
         let project_dir = snapshot.project_dir.as_deref()?;
 
         if let Some(encoded) = project_dir.strip_prefix("__encoded__:") {
-            return sessions
-                .iter()
-                .find(|session| encode_agent_project_dir(&session.dir) == encoded)
-                .map(|session| session.name.clone());
+            for provider in &self.providers {
+                if let Some(name) = provider
+                    .list_sessions()
+                    .iter()
+                    .find(|session| encode_agent_project_dir(&session.dir) == encoded)
+                    .map(|session| session.name.clone())
+                {
+                    return Some(name);
+                }
+            }
+            return None;
         }
 
-        let dir_session_map = build_dir_session_map(
-            sessions
-                .into_iter()
-                .map(|session| (session.name, session.dir)),
-        );
-        resolve_session_for_project_dir(project_dir, &dir_session_map)
+        self.resolve_session_for_project_dir_local_first(project_dir)
+    }
+
+    /// Resolve a project dir to a session, scoping resolution to the first
+    /// provider (registration order — local tmux first) that has any
+    /// candidate dirs. Keeping providers separate prevents identical paths
+    /// on remote machines (remote sessions are namespaced `host/name` but
+    /// share absolute dirs like `~/src/foo`) from making local agent events
+    /// ambiguous — an ambiguous match drops the event, freezing the agent's
+    /// last status in the tracker forever.
+    fn resolve_session_for_project_dir_local_first(&self, project_dir: &str) -> Option<String> {
+        for provider in &self.providers {
+            let dir_session_map = build_dir_session_map(
+                provider
+                    .list_sessions()
+                    .into_iter()
+                    .map(|session| (session.name, session.dir)),
+            );
+            if has_candidates_for_project_dir(project_dir, &dir_session_map) {
+                return resolve_session_for_project_dir(project_dir, &dir_session_map);
+            }
+        }
+        None
     }
 
     fn resolve_agent_event_session(&self, body: &Value) -> Option<String> {
-        let sessions = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .collect::<Vec<_>>();
-
-        if let Some(project_dir) = body.get("projectDir").and_then(Value::as_str) {
-            let dir_session_map = build_dir_session_map(
-                sessions
-                    .iter()
-                    .map(|session| (session.name.clone(), session.dir.clone())),
-            );
-            if let Some(session) = resolve_session_for_project_dir(project_dir, &dir_session_map) {
-                return Some(session);
-            }
+        if let Some(project_dir) = body.get("projectDir").and_then(Value::as_str)
+            && let Some(session) = self.resolve_session_for_project_dir_local_first(project_dir)
+        {
+            return Some(session);
         }
 
         body.get("tmuxSession")
             .and_then(Value::as_str)
-            .filter(|tmux_session| sessions.iter().any(|session| session.name == *tmux_session))
+            .filter(|tmux_session| {
+                self.providers.iter().any(|provider| {
+                    provider
+                        .list_sessions()
+                        .iter()
+                        .any(|session| session.name == *tmux_session)
+                })
+            })
             .map(ToString::to_string)
     }
 
@@ -2642,21 +2684,27 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source
-            && let Err(err) = state_source.handle_pi_runtime_delete(&body)
-        {
-            let body = err.body();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            let _ = stream.shutdown().await;
-            return Ok(());
+        if let Some(state_source) = &state_source {
+            match state_source.handle_pi_runtime_delete(&body) {
+                Ok(Some(payload)) => {
+                    let _ = state_updates.send(payload);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let body = err.body();
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                    let _ = stream.shutdown().await;
+                    return Ok(());
+                }
+            }
         }
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -3032,13 +3080,23 @@ mod tests {
 
     struct FakeProvider {
         provider_name: &'static str,
-        sessions: Vec<&'static str>,
+        sessions: Vec<(&'static str, &'static str)>,
         switched: PlMutex<Vec<(String, Option<String>)>>,
         killed: PlMutex<Vec<String>>,
     }
 
     impl FakeProvider {
         fn new(provider_name: &'static str, sessions: Vec<&'static str>) -> Arc<Self> {
+            Self::with_dirs(
+                provider_name,
+                sessions.into_iter().map(|name| (name, "")).collect(),
+            )
+        }
+
+        fn with_dirs(
+            provider_name: &'static str,
+            sessions: Vec<(&'static str, &'static str)>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 provider_name,
                 sessions,
@@ -3056,10 +3114,10 @@ mod tests {
         fn list_sessions(&self) -> Vec<MuxSessionInfo> {
             self.sessions
                 .iter()
-                .map(|name| MuxSessionInfo {
+                .map(|(name, dir)| MuxSessionInfo {
                     name: (*name).to_string(),
                     created_at: 0,
-                    dir: String::new(),
+                    dir: (*dir).to_string(),
                     windows: 1,
                 })
                 .collect()
@@ -3075,8 +3133,12 @@ mod tests {
             None
         }
 
-        fn get_session_dir(&self, _name: &str) -> String {
-            String::new()
+        fn get_session_dir(&self, name: &str) -> String {
+            self.sessions
+                .iter()
+                .find(|(session, _)| *session == name)
+                .map(|(_, dir)| (*dir).to_string())
+                .unwrap_or_default()
         }
 
         fn get_pane_count(&self, _name: &str) -> u32 {
@@ -3183,5 +3245,81 @@ mod tests {
 
         assert_eq!(remote.killed.lock().as_slice(), &["web-1/main".to_string()]);
         assert!(local.killed.lock().is_empty());
+    }
+
+    #[test]
+    fn dismiss_agent_command_removes_the_tracker_entry() {
+        let local = FakeProvider::with_dirs("tmux", vec![("work", "/home/u/work")]);
+        let source = source_with(vec![local]);
+
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "pi",
+                "status": "running",
+                "threadId": "T-1",
+                "projectDir": "/home/u/work",
+            }))
+            .expect("event resolves to the work session");
+        assert_eq!(source.agent_tracker.lock().unwrap().get_agents("work").len(), 1);
+
+        let snapshot = source.handle_client_command(&serde_json::json!({
+            "type": "dismiss-agent",
+            "session": "work",
+            "agent": "pi",
+            "threadId": "T-1",
+        }));
+
+        assert!(snapshot.is_some());
+        assert!(source.agent_tracker.lock().unwrap().get_agents("work").is_empty());
+    }
+
+    #[test]
+    fn agent_events_resolve_to_the_local_provider_when_remote_shares_the_dir() {
+        let local = FakeProvider::with_dirs("tmux", vec![("work", "/home/u/src/foo")]);
+        let remote = FakeProvider::with_dirs("tmux-remote", vec![("web-1/work", "/home/u/src/foo")]);
+        let source = source_with(vec![local, remote]);
+
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "pi",
+                "status": "running",
+                "threadId": "T-1",
+                "projectDir": "/home/u/src/foo",
+            }))
+            .expect("colliding remote dir must not make the local event ambiguous");
+
+        let tracker = source.agent_tracker.lock().unwrap();
+        assert_eq!(tracker.get_agents("work").len(), 1);
+        assert!(tracker.get_agents("web-1/work").is_empty());
+    }
+
+    #[test]
+    fn pi_runtime_delete_dismisses_the_tracked_agent() {
+        let local = FakeProvider::with_dirs("tmux", vec![("work", "/home/u/work")]);
+        let source = source_with(vec![local]);
+
+        source
+            .handle_pi_runtime_upsert(&serde_json::json!({
+                "pid": 4242,
+                "sessionId": "S-1",
+                "cwd": "/home/u/work",
+                "ts": 1,
+            }))
+            .expect("upsert");
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "pi",
+                "status": "running",
+                "threadId": "S-1",
+                "projectDir": "/home/u/work",
+            }))
+            .expect("event resolves to the work session");
+
+        let snapshot = source
+            .handle_pi_runtime_delete(&serde_json::json!({ "pid": 4242 }))
+            .expect("delete succeeds");
+
+        assert!(snapshot.is_some());
+        assert!(source.agent_tracker.lock().unwrap().get_agents("work").is_empty());
     }
 }
