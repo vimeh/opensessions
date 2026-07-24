@@ -81,12 +81,18 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     let expanded_worktree = lab.capture_pane(&worktree_source);
     assert_worktree_group_columns(&expanded_worktree);
 
+    // Down onto the confirmed local child row must not re-switch the client;
+    // the next Down highlights os-demo-preview and switches without Enter.
     lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Down"]);
+    sleep(Duration::from_millis(250));
+    let clients = lab.tmux(["list-clients", "-F", "#{client_session}"]);
+    assert!(
+        clients
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim() == "os-demo-feat-agent-panel"),
+        "highlighting the confirmed local session must not switch the client; got:\n{clients}",
+    );
     lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Down"]);
-    lab.wait_for_capture_pane(&worktree_source, |text| {
-        row_with(text, "os-demo-preview").is_some_and(|row| row.contains("›"))
-    });
-    lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Enter"]);
     lab.wait_for_client_session("os-demo-preview");
     lab.wait_for_capture_pane(&worktree_dest, |text| {
         row_with(text, "os-demo-preview").is_some_and(|row| row.contains("▌"))
@@ -245,7 +251,7 @@ fn tmux_sidebar_reorders_normal_session_across_worktree_group_boundary() {
 }
 
 #[test]
-fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
+fn tmux_sidebar_rehomes_focus_after_highlight_driven_switch() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-rehome-return-focus");
     let second_window = lab.spawn_window_with_sidebar("opensessions", "second-sidebar");
@@ -260,24 +266,14 @@ fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
         row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
     });
 
-    lab.move_focus_off_active(&source, "opensessions");
-    lab.move_focus_off_active(&second, "opensessions");
-    let stale_capture = lab.capture_pane(&source);
-    assert!(
-        has_non_active_focus_marker(&stale_capture, "opensessions"),
-        "test setup should leave a stale non-active focus row before switching away; got:\n{stale_capture}",
-    );
-    let second_stale_capture = lab.capture_pane(&second);
-    assert!(
-        has_non_active_focus_marker(&second_stale_capture, "opensessions"),
-        "test setup should leave every opensessions sidebar with stale temporary focus; got:\n{second_stale_capture}",
-    );
+    // A single Up highlights the previous visible session (a concrete row,
+    // not the worktree group header below) and switches without Enter.
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Up"]);
+    let destination = lab.wait_for_client_session_other_than("opensessions");
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "1"]);
-    lab.wait_for_client_session("effect-ts");
-    let effect = lab.sidebar_pane("effect-ts");
-    lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
-    lab.click_session_row(&effect, "opensessions");
+    let dest_sidebar = lab.sidebar_pane(&destination);
+    lab.tmux_ok(["select-pane", "-t", dest_sidebar.as_str()]);
+    lab.click_session_row(&dest_sidebar, "opensessions");
 
     let first_visible = lab.first_capture_after_client_session("opensessions", &source);
     assert!(
@@ -1424,6 +1420,30 @@ time.sleep(300)
         );
     }
 
+    fn wait_for_client_session_other_than(&self, current: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
+            if let Some(session) = output
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && *line != current)
+            {
+                return session.to_string();
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for client to leave session {current}; clients:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-clients",
+                "-F",
+                "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.logs(),
+        );
+    }
+
     fn wait_for_active_window(&self, session: &str, expected_window: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let target = exact_session_target(session);
@@ -1617,16 +1637,6 @@ time.sleep(300)
             self.tmux(["show-hooks", "-g"]),
             self.logs(),
         );
-    }
-
-    fn move_focus_off_active(&self, pane: &str, active_session: &str) {
-        for _ in 0..6 {
-            self.tmux_ok(["send-keys", "-t", pane, "Down"]);
-            sleep(Duration::from_millis(100));
-            if has_non_active_focus_marker(&self.capture_pane(pane), active_session) {
-                return;
-            }
-        }
     }
 
     fn send_sidebar_key(&self, pane: &str, key: &str) {

@@ -587,9 +587,35 @@ impl App {
             .unwrap_or(0);
         let max_idx = targets.len() - 1;
         let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
-        if next_idx != current_idx {
-            self.set_sidebar_focus(targets[next_idx].clone());
+        if next_idx == current_idx {
+            return;
         }
+        let target = targets[next_idx].clone();
+        self.set_sidebar_focus(target.clone());
+        // Highlight-driven switching: landing on a concrete session row
+        // switches the attached tmux client immediately; worktree group
+        // headers stay browse-only so collapse/expand remains reachable.
+        if let SidebarFocus::Session(name) = target {
+            self.switch_to_highlighted_session(name);
+        }
+    }
+
+    /// Queue a `SwitchSession` for a keyboard-highlighted session row.
+    ///
+    /// Skips the command when the highlight is already on this client's
+    /// confirmed session with no switch in flight, and when the same target
+    /// is already pending, so repeated navigation stays idempotent while a
+    /// reversed highlight (A -> B -> A) still makes the final row win.
+    fn switch_to_highlighted_session(&mut self, name: String) {
+        if self.pending_switch_session.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        if self.pending_switch_session.is_none()
+            && self.confirmed_local_session_name() == Some(name.as_str())
+        {
+            return;
+        }
+        self.request_session_switch(name, true);
     }
 
     pub fn session_scroll_offset(&self) -> usize {
@@ -1630,6 +1656,115 @@ mod tests {
             vec![ClientCommand::ReorderWorktreeGroup {
                 key: "/repo/worktrees".to_string(),
                 delta: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn arrow_highlight_onto_concrete_session_switches_without_enter() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+        assert_eq!(app.drain_commands(), Vec::new());
+
+        app.move_focus(1);
+
+        assert_eq!(app.focused_session_name(), Some("beta"));
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "beta".to_string(),
+                client_tty: None,
+            }]
+        );
+        assert_eq!(app.pending_switch_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn arrow_highlight_onto_worktree_group_header_stays_browse_only() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("main", "/repo", false),
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "main".to_string(), None);
+
+        app.move_focus(1);
+
+        assert_eq!(app.focused_group_key(), Some("/repo/worktrees"));
+        assert_eq!(app.drain_commands(), Vec::new());
+        assert_eq!(app.pending_switch_session, None);
+    }
+
+    #[test]
+    fn arrow_highlight_at_list_edge_emits_no_switch() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+
+        app.move_focus(-1);
+
+        assert_eq!(app.focused_session_name(), Some("alpha"));
+        assert_eq!(app.drain_commands(), Vec::new());
+    }
+
+    #[test]
+    fn reversed_highlight_makes_final_session_win_over_pending_switch() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+
+        app.move_focus(1);
+        app.move_focus(-1);
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![
+                ClientCommand::SwitchSession {
+                    name: "beta".to_string(),
+                    client_tty: None,
+                },
+                ClientCommand::SwitchSession {
+                    name: "alpha".to_string(),
+                    client_tty: None,
+                },
+            ]
+        );
+        assert_eq!(app.pending_switch_session.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn repeated_highlight_of_pending_switch_target_is_idempotent() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+
+        app.move_focus(1);
+        app.move_focus(1);
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "beta".to_string(),
+                client_tty: None,
             }]
         );
     }

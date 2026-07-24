@@ -8,7 +8,8 @@ The intended test surface is product E2E only: each test creates real fake git r
 
 | Behavior | E2E coverage |
 | --- | --- |
-| Session keyboard focus is local, `Tab` switches, `j`/`k` browse temporary focus, and worktree group focus rehomes to the chosen child session. | `tmux_sidebar_keyboard_focus_and_worktree_flow` |
+| Highlighting a concrete session with `j`/`k`/arrows switches without `Enter`, the confirmed local session is not re-switched, worktree group headers stay browse-only with `Enter` toggling collapse, and group focus rehomes to the chosen child session. | `tmux_sidebar_keyboard_focus_and_worktree_flow` |
+| A single `Down` switches the attached client, and returning to the origin session leaves every one of its sidebars showing the confirmed active row with no stale focus marker. | `tmux_sidebar_rehomes_focus_after_highlight_driven_switch` |
 | Explicit foreground sidebar resize persists once and fans out to every managed sidebar pane in the tmux server. | `tmux_sidebar_width_resize_fans_out_to_every_session_sidebar` |
 | `q` in a connected sidebar shuts down the server and every connected sidebar client. | `tmux_sidebar_quit_closes_the_server_and_every_sidebar_client` |
 | Two attached tmux clients can keep independent active rows instead of a global server focus row overriding every sidebar. | `tmux_sidebar_multiple_clients_keep_independent_active_rows` |
@@ -32,7 +33,7 @@ The intended test surface is product E2E only: each test creates real fake git r
 
 These are still mostly protected by final-state assertions rather than visual frame-by-frame checks:
 
-- no visible intermediate flicker during `Tab` and `Enter` switching
+- no visible intermediate flicker during `Tab` and highlight-driven switching
 - full terminal resize across multiple actual terminal emulator window sizes
 - control-mode client interference
 - tmux `window-size latest` restoration after every possible resize path
