@@ -118,6 +118,7 @@ pub struct App {
     pub resize_drag_state: Option<(u16, usize)>,
     pub pending_switch_session: Option<String>,
     pending_highlight_switch: Option<(String, Instant)>,
+    last_focus_move_at: Option<Instant>,
     group_focus_surrogate_for: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
     last_activated_session: Option<String>,
@@ -167,6 +168,7 @@ impl App {
             resize_drag_state: None,
             pending_switch_session: None,
             pending_highlight_switch: None,
+            last_focus_move_at: None,
             group_focus_surrogate_for: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
             last_activated_session: None,
@@ -600,18 +602,32 @@ impl App {
         }
         let target = targets[next_idx].clone();
         self.set_sidebar_focus(target.clone());
-        // Highlight-driven switching: landing on a concrete session row arms
-        // a short debounce; the switch commits once the highlight rests so
-        // key-repeat browsing does not fire a tmux switch per crossed row.
-        // Worktree group headers stay browse-only so collapse/expand remains
+        // Highlight-driven switching with an adaptive debounce: a discrete
+        // keypress (no other focus movement within the debounce window)
+        // switches immediately so single hops feel instant; rapid key-repeat
+        // browsing arms a short debounce instead, so scanning does not fire a
+        // tmux switch per crossed row and the resting row wins. Worktree
+        // group headers stay browse-only so collapse/expand remains
         // reachable, and moving onto one abandons any armed switch.
+        let now = Instant::now();
+        let rapid = self.last_focus_move_at.is_some_and(|at| {
+            now.duration_since(at) < Duration::from_millis(HIGHLIGHT_SWITCH_DEBOUNCE_MS)
+        });
+        self.last_focus_move_at = Some(now);
         match target {
-            SidebarFocus::Session(name) => self.arm_highlight_switch(name),
+            SidebarFocus::Session(name) => {
+                if rapid {
+                    self.arm_highlight_switch(name, now);
+                } else {
+                    self.pending_highlight_switch = None;
+                    self.switch_to_highlighted_session(name);
+                }
+            }
             SidebarFocus::WorktreeGroup(_) => self.pending_highlight_switch = None,
         }
     }
 
-    fn arm_highlight_switch(&mut self, name: String) {
+    fn arm_highlight_switch(&mut self, name: String, now: Instant) {
         if self.pending_switch_session.is_none()
             && self.confirmed_local_session_name() == Some(name.as_str())
         {
@@ -620,10 +636,25 @@ impl App {
             self.pending_highlight_switch = None;
             return;
         }
-        self.pending_highlight_switch = Some((
-            name,
-            Instant::now() + Duration::from_millis(HIGHLIGHT_SWITCH_DEBOUNCE_MS),
-        ));
+        self.pending_highlight_switch =
+            Some((name, now + Duration::from_millis(HIGHLIGHT_SWITCH_DEBOUNCE_MS)));
+    }
+
+    /// Queue a `SwitchSession` for a discretely highlighted session row.
+    ///
+    /// Skips the command when the highlight is already on this client's
+    /// confirmed session with no switch in flight, and when the same target
+    /// is already the in-flight switch, so navigation stays idempotent.
+    fn switch_to_highlighted_session(&mut self, name: String) {
+        if self.pending_switch_session.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        if self.pending_switch_session.is_none()
+            && self.confirmed_local_session_name() == Some(name.as_str())
+        {
+            return;
+        }
+        self.request_session_switch(name, true);
     }
 
     /// Deadline of the armed highlight switch, if any. The event loop sleeps
@@ -1706,7 +1737,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_highlight_arms_debounce_and_commit_switches_without_enter() {
+    fn discrete_highlight_onto_concrete_session_switches_immediately() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
@@ -1719,15 +1750,11 @@ mod tests {
         app.move_focus(1);
 
         assert_eq!(app.focused_session_name(), Some("beta"));
-        assert!(app.highlight_switch_deadline().is_some());
         assert_eq!(
-            app.drain_commands(),
-            Vec::new(),
-            "no switch may fire before the debounce commits"
+            app.highlight_switch_deadline(),
+            None,
+            "a discrete press must not pay the repeat debounce"
         );
-
-        app.commit_highlight_switch();
-
         assert_eq!(
             app.drain_commands(),
             vec![ClientCommand::SwitchSession {
@@ -1736,7 +1763,6 @@ mod tests {
             }]
         );
         assert_eq!(app.pending_switch_session.as_deref(), Some("beta"));
-        assert_eq!(app.highlight_switch_deadline(), None);
     }
 
     #[test]
@@ -1773,9 +1799,13 @@ mod tests {
         app.move_focus(-1);
 
         assert_eq!(app.focused_session_name(), Some("gamma"));
-        assert!(
-            app.highlight_switch_deadline().is_some(),
-            "wrapping onto a concrete row must arm the switch debounce"
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "gamma".to_string(),
+                client_tty: None,
+            }],
+            "wrapping onto a concrete row via a discrete press must switch"
         );
     }
 
@@ -1819,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn reversed_highlight_within_debounce_sends_no_switch_at_all() {
+    fn reversed_rapid_highlight_makes_the_confirmed_row_win() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
@@ -1828,41 +1858,61 @@ mod tests {
         let mut app = App::from_state(state);
         app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
+        // Discrete press switches to beta immediately; the rapid reversal
+        // arms alpha (a switch is in flight) and the commit sends it, so the
+        // final highlighted row always wins.
         app.move_focus(1);
         app.move_focus(-1);
+        assert!(app.highlight_switch_deadline().is_some());
+        app.commit_highlight_switch();
 
         assert_eq!(
-            app.highlight_switch_deadline(),
-            None,
-            "resting back on the confirmed row must disarm the debounce"
+            app.drain_commands(),
+            vec![
+                ClientCommand::SwitchSession {
+                    name: "beta".to_string(),
+                    client_tty: None,
+                },
+                ClientCommand::SwitchSession {
+                    name: "alpha".to_string(),
+                    client_tty: None,
+                },
+            ]
         );
-        app.commit_highlight_switch();
-        assert_eq!(app.drain_commands(), Vec::new());
-        assert_eq!(app.pending_switch_session, None);
     }
 
     #[test]
-    fn browsing_across_rows_commits_only_the_final_highlight() {
+    fn rapid_browsing_coalesces_crossed_rows_into_the_resting_row() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
             session("beta", "/tmp/beta", false),
             session("gamma", "/tmp/gamma", false),
+            session("delta", "/tmp/delta", false),
         ];
         let mut app = App::from_state(state);
         app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
+        // First press of the burst is discrete and switches to beta; the
+        // rapid repeats cross gamma without switching and rest on delta.
+        app.move_focus(1);
         app.move_focus(1);
         app.move_focus(1);
         app.commit_highlight_switch();
 
         assert_eq!(
             app.drain_commands(),
-            vec![ClientCommand::SwitchSession {
-                name: "gamma".to_string(),
-                client_tty: None,
-            }],
-            "crossed intermediate rows must not produce switches"
+            vec![
+                ClientCommand::SwitchSession {
+                    name: "beta".to_string(),
+                    client_tty: None,
+                },
+                ClientCommand::SwitchSession {
+                    name: "delta".to_string(),
+                    client_tty: None,
+                },
+            ],
+            "rows crossed during key repeat must not produce switches"
         );
     }
 
@@ -1877,8 +1927,7 @@ mod tests {
         app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
         app.move_focus(1);
-        app.commit_highlight_switch();
-        app.drain_commands();
+        assert_eq!(app.drain_commands().len(), 1, "discrete press switches");
 
         app.move_focus(-1);
         app.move_focus(1);
@@ -1897,19 +1946,28 @@ mod tests {
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
             session("beta", "/tmp/beta", false),
+            session("gamma", "/tmp/gamma", false),
         ];
         let mut app = App::from_state(state);
         app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
         app.move_focus(1);
+        app.move_focus(1);
+        assert!(app.highlight_switch_deadline().is_some());
         app.activate_focused_item();
 
         assert_eq!(
             app.drain_commands(),
-            vec![ClientCommand::SwitchSession {
-                name: "beta".to_string(),
-                client_tty: None,
-            }]
+            vec![
+                ClientCommand::SwitchSession {
+                    name: "beta".to_string(),
+                    client_tty: None,
+                },
+                ClientCommand::SwitchSession {
+                    name: "gamma".to_string(),
+                    client_tty: None,
+                },
+            ]
         );
         assert_eq!(app.highlight_switch_deadline(), None);
         app.commit_highlight_switch();
