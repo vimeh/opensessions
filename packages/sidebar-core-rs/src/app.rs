@@ -591,8 +591,10 @@ impl App {
                     .and_then(|focus| targets.iter().position(|target| target == &focus))
             })
             .unwrap_or(0);
-        let max_idx = targets.len() - 1;
-        let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
+        // Wrap at the edges: Up from the top row lands on the bottom row and
+        // Down from the bottom row lands back on the top row.
+        let len = targets.len() as i16;
+        let next_idx = (current_idx as i16 + delta as i16).rem_euclid(len) as usize;
         if next_idx == current_idx {
             return;
         }
@@ -1758,15 +1760,57 @@ mod tests {
     }
 
     #[test]
-    fn arrow_highlight_at_list_edge_arms_nothing() {
+    fn arrow_up_from_top_wraps_to_bottom_row() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
             session("beta", "/tmp/beta", false),
+            session("gamma", "/tmp/gamma", false),
         ];
         let mut app = App::from_state(state);
         app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
+        app.move_focus(-1);
+
+        assert_eq!(app.focused_session_name(), Some("gamma"));
+        assert!(
+            app.highlight_switch_deadline().is_some(),
+            "wrapping onto a concrete row must arm the switch debounce"
+        );
+    }
+
+    #[test]
+    fn arrow_down_from_bottom_wraps_to_top_row() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+            session("gamma", "/tmp/gamma", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+        app.set_focused_session("gamma");
+
+        app.move_focus(1);
+
+        assert_eq!(app.focused_session_name(), Some("alpha"));
+        assert_eq!(
+            app.highlight_switch_deadline(),
+            None,
+            "wrapping back onto the confirmed row must disarm the debounce"
+        );
+        app.commit_highlight_switch();
+        assert_eq!(app.drain_commands(), Vec::new());
+    }
+
+    #[test]
+    fn single_session_list_does_not_wrap_into_itself() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("alpha", "/tmp/alpha", false)];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+
+        app.move_focus(1);
         app.move_focus(-1);
 
         assert_eq!(app.focused_session_name(), Some("alpha"));
