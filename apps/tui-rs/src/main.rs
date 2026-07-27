@@ -138,6 +138,9 @@ async fn main() -> Result<()> {
         // a re-render at the deadline so the highlight clears even without any
         // other event.
         let flash_deadline = app.as_ref().and_then(|app| app.flash_deadline);
+        // Highlight-switch debounce: commit the armed switch once the
+        // keyboard highlight has rested on a session row.
+        let highlight_switch_due = app.as_ref().and_then(|app| app.highlight_switch_deadline());
         let sidebar_width_due = pending_sidebar_width.as_ref().map(|pending| pending.due_at);
 
         tokio::select! {
@@ -197,6 +200,22 @@ async fn main() -> Result<()> {
                 if let Some(app) = &mut app {
                     app.flash_target = None;
                     app.flash_deadline = None;
+                    terminal.draw(app)?;
+                }
+                continue;
+            }
+
+            _ = async {
+                match highlight_switch_due {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if let Some(app) = &mut app {
+                    app.commit_highlight_switch();
+                    for command in app.drain_commands() {
+                        send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
+                    }
                     terminal.draw(app)?;
                 }
                 continue;

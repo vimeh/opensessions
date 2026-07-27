@@ -752,7 +752,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                self.provider_for_session(name)?.switch_session(name, client_tty);
+                let started = std::time::Instant::now();
+                let provider = self.provider_for_session(name)?;
+                let resolve_ms = started.elapsed().as_millis();
+                provider.switch_session(name, client_tty);
+                debug_log(format!(
+                    "switch-session name={name} resolve={resolve_ms}ms total={}ms",
+                    started.elapsed().as_millis(),
+                ));
                 None
             }
             "switch-index" => {
