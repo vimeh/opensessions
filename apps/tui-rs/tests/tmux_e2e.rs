@@ -1145,6 +1145,13 @@ time.sleep(300)
             .env("OPENSESSIONS_WIDTH", "35")
             .env("OPENSESSIONS_HOST", "127.0.0.1")
             .env("OPENSESSIONS_PORT", self.port.to_string())
+            // Isolate remote-session discovery: without this, a live
+            // ssh-tmux-nav forwarded socket in /tmp leaks the developer's
+            // remote sessions (e.g. hermes/0) into every lab's session list.
+            .env(
+                "OPENSESSIONS_REMOTE_DISCOVERY_ROOT",
+                self.root.to_str().unwrap(),
+            )
             .env(
                 "OPENSESSIONS_DEBUG_LOG",
                 self.root.join("debug.log").to_str().unwrap(),

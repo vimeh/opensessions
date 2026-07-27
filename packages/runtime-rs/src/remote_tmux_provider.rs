@@ -123,7 +123,12 @@ impl RemoteTmuxProvider {
 
 impl Default for RemoteTmuxProvider {
     fn default() -> Self {
-        Self::new("/tmp", std::env::var("USER").unwrap_or_default())
+        // `OPENSESSIONS_REMOTE_DISCOVERY_ROOT` overrides where forwarded
+        // ssh-tmux-nav sockets are discovered; tests point it at an isolated
+        // directory so a developer's live remote sessions never leak in.
+        let discovery_root = std::env::var("OPENSESSIONS_REMOTE_DISCOVERY_ROOT")
+            .unwrap_or_else(|_| "/tmp".to_string());
+        Self::new(discovery_root, std::env::var("USER").unwrap_or_default())
     }
 }
 

@@ -64,6 +64,12 @@ const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const TMUX_STATE_POLL_MS: u64 = 2_000;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
+/// Minimum spacing between ensure-driven sidebar spawns into the same window.
+/// A just-spawned sidebar pane is untitled until `set_pane_title` lands, so a
+/// second ensure hook racing the first (remote switches fire
+/// client-session-changed and after-select-window back to back) would still
+/// scan "no sidebar here" and stack a duplicate.
+const SIDEBAR_ENSURE_RESPAWN_GUARD_MS: u64 = 2_000;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
@@ -364,6 +370,7 @@ pub struct ReadOnlyMuxStateSource {
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
+    recent_ensure_spawns: parking_lot::Mutex<HashMap<String, u64>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -412,6 +419,7 @@ impl ReadOnlyMuxStateSource {
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
+            recent_ensure_spawns: parking_lot::Mutex::new(HashMap::new()),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -1619,18 +1627,42 @@ impl ReadOnlyMuxStateSource {
             let (Some(session_name), Some(window_id)) = (session_name, window_id) else {
                 continue;
             };
+            // Dedupe by window across ALL sessions: hook contexts can carry a
+            // session that does not own `window_id` (remote switches fire
+            // client-session-changed and after-select-window with skewed
+            // contexts), and a session-scoped check then misses the window's
+            // existing sidebar and stacks a duplicate into it.
             if provider
-                .list_sidebar_panes(Some(&session_name))
+                .list_sidebar_panes(None)
                 .iter()
                 .any(|pane| pane.window_id == window_id)
             {
                 continue;
+            }
+            {
+                let now = (self.now_ms)();
+                let mut recent = self.recent_ensure_spawns.lock();
+                if let Some(last) = recent.get(&window_id)
+                    && now.saturating_sub(*last) < SIDEBAR_ENSURE_RESPAWN_GUARD_MS
+                {
+                    debug_log(format!(
+                        "ensure_sidebar: skipped respawn burst for window={window_id}"
+                    ));
+                    continue;
+                }
+                recent.insert(window_id.clone(), now);
+                recent.retain(|_, at| {
+                    now.saturating_sub(*at) < SIDEBAR_ENSURE_RESPAWN_GUARD_MS.saturating_mul(10)
+                });
             }
             let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
             self.sidebar_coordinator
                 .lock()
                 .unwrap()
                 .begin_warmup_until(warmup_until);
+            debug_log(format!(
+                "ensure_sidebar: spawning in session={session_name} window={window_id} width={width}"
+            ));
             provider.spawn_sidebar(
                 &session_name,
                 &window_id,
@@ -3167,6 +3199,96 @@ mod tests {
         fn cleanup_hooks(&self) {}
     }
 
+    struct SidebarFakeProvider {
+        sidebar_panes: PlMutex<Vec<opensessions_runtime::mux::SidebarPane>>,
+        spawned: PlMutex<Vec<(String, String)>>,
+    }
+
+    impl SidebarFakeProvider {
+        fn new(sidebar_panes: Vec<(&str, &str)>) -> Arc<Self> {
+            Arc::new(Self {
+                sidebar_panes: PlMutex::new(
+                    sidebar_panes
+                        .into_iter()
+                        .map(|(session, window)| opensessions_runtime::mux::SidebarPane {
+                            pane_id: "%0".to_string(),
+                            session_name: session.to_string(),
+                            window_id: window.to_string(),
+                            width: Some(32),
+                            window_width: Some(200),
+                        })
+                        .collect(),
+                ),
+                spawned: PlMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl MuxProvider for SidebarFakeProvider {
+        fn name(&self) -> &str {
+            "tmux"
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            Vec::new()
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            0
+        }
+
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+
+        fn kill_session(&self, _name: &str) {}
+
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+
+        fn cleanup_hooks(&self) {}
+
+        fn is_window_capable(&self) -> bool {
+            true
+        }
+
+        fn is_sidebar_capable(&self) -> bool {
+            true
+        }
+
+        fn list_sidebar_panes(
+            &self,
+            _session_name: Option<&str>,
+        ) -> Vec<opensessions_runtime::mux::SidebarPane> {
+            self.sidebar_panes.lock().clone()
+        }
+
+        fn spawn_sidebar(
+            &self,
+            session_name: &str,
+            window_id: &str,
+            _width: u16,
+            _position: SidebarPosition,
+            _scripts_dir: &str,
+        ) -> Option<String> {
+            self.spawned
+                .lock()
+                .push((session_name.to_string(), window_id.to_string()));
+            Some("%new".to_string())
+        }
+    }
+
     struct NoPorts;
 
     impl PortCommandRunner for NoPorts {
@@ -3192,6 +3314,38 @@ mod tests {
             .with_port_command_runner(Arc::new(NoPorts))
             .with_git_command_runner(Arc::new(NoGit))
             .with_now_ms(|| 0)
+    }
+
+    #[test]
+    fn ensure_sidebar_dedupes_by_window_even_with_mismatched_session_context() {
+        let provider = SidebarFakeProvider::new(vec![("nixos-config", "@53")]);
+        let source = source_with(vec![provider.clone()]);
+        source.sidebar_coordinator.lock().unwrap().begin_warmup();
+
+        // Hook context names a session that does not own @53; the window's
+        // existing sidebar must still block the spawn.
+        let spawned = source.ensure_sidebar("/dev/pts/0|doss|@53|%164|1");
+
+        assert!(!spawned, "mismatched session context must not spawn");
+        assert!(provider.spawned.lock().is_empty());
+    }
+
+    #[test]
+    fn ensure_sidebar_guards_rapid_respawn_bursts_per_window() {
+        let provider = SidebarFakeProvider::new(Vec::new());
+        let source = source_with(vec![provider.clone()]);
+        source.sidebar_coordinator.lock().unwrap().begin_warmup();
+
+        // Remote switches fire client-session-changed and after-select-window
+        // back to back; the just-spawned pane is not yet titled, so only the
+        // per-window guard can stop the second spawn.
+        assert!(source.ensure_sidebar("/dev/pts/0|nixos-config|@53|%164|1"));
+        assert!(!source.ensure_sidebar("/dev/pts/0|doss|@53|%164|1"));
+        assert_eq!(provider.spawned.lock().len(), 1);
+
+        // A different window is unaffected by the guard.
+        assert!(source.ensure_sidebar("/dev/pts/0|nixos-config|@60|%12|1"));
+        assert_eq!(provider.spawned.lock().len(), 2);
     }
 
     #[test]
