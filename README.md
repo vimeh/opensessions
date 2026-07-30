@@ -87,7 +87,7 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 - Per-thread unseen markers for `done`, `error`, and `interrupted` states.
 - Session context in the UI: branch in the list, working directory in the detail panel, thread names, and detected localhost ports.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
-- Fast switching: `j`/`k` and arrows switch instantly on a discrete press (no `Enter`) and settle on the resting row during key-repeat, wrap around at the top/bottom of the list, plus `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
+- Fast switching: `j`/`k` and arrows switch as soon as a session row is highlighted (no `Enter`; rapid scanning is coalesced server-side so the latest row wins), wrap around at the top/bottom of the list, plus `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
 - `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, and in-app theme switching.
 - Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local Rust WebSocket/HTTP server.
 

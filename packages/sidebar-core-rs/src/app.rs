@@ -14,10 +14,6 @@ use crate::session_display::{session_display_entries, worktree_group_key};
 pub const SESSION_CARD_HEIGHT: usize = 2;
 const MIN_DETAIL_PANEL_HEIGHT: usize = 4;
 const MAX_DETAIL_PANEL_HEIGHT: usize = 60;
-/// How long the keyboard highlight must rest on a session row before the
-/// sidebar commits a switch. Keeps key-repeat browsing from firing a tmux
-/// switch (~80-110ms each, plus hook fan-out) per crossed row.
-pub const HIGHLIGHT_SWITCH_DEBOUNCE_MS: u64 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelFocus {
@@ -117,8 +113,6 @@ pub struct App {
     session_scroll_follows_focus: bool,
     pub resize_drag_state: Option<(u16, usize)>,
     pub pending_switch_session: Option<String>,
-    pending_highlight_switch: Option<(String, Instant)>,
-    last_focus_move_at: Option<Instant>,
     group_focus_surrogate_for: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
     last_activated_session: Option<String>,
@@ -167,8 +161,6 @@ impl App {
             session_scroll_follows_focus: true,
             resize_drag_state: None,
             pending_switch_session: None,
-            pending_highlight_switch: None,
-            last_focus_move_at: None,
             group_focus_surrogate_for: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
             last_activated_session: None,
@@ -287,13 +279,6 @@ impl App {
                 name,
                 source_pane_id,
             } => {
-                // A switch just happened somewhere in this tmux server. Seed
-                // the focus-movement clock so a keypress landing here within
-                // the debounce window counts as mid-scan (key-repeat walking
-                // across sessions hops sidebar processes, and each fresh
-                // sidebar would otherwise treat its first repeat as a
-                // discrete press and switch immediately — a switch per row).
-                self.last_focus_move_at = Some(Instant::now());
                 let previous_activated = self.last_activated_session.replace(name.clone());
                 let from_this_pane = self
                     .pane_identity
@@ -609,84 +594,26 @@ impl App {
         }
         let target = targets[next_idx].clone();
         self.set_sidebar_focus(target.clone());
-        // Highlight-driven switching with an adaptive debounce: a discrete
-        // keypress (no other focus movement within the debounce window)
-        // switches immediately so single hops feel instant; rapid key-repeat
-        // browsing arms a short debounce instead, so scanning does not fire a
-        // tmux switch per crossed row and the resting row wins. Worktree
-        // group headers stay browse-only so collapse/expand remains
-        // reachable, and moving onto one abandons any armed switch.
-        let now = Instant::now();
-        let rapid = self.last_focus_move_at.is_some_and(|at| {
-            now.duration_since(at) < Duration::from_millis(HIGHLIGHT_SWITCH_DEBOUNCE_MS)
-        });
-        self.last_focus_move_at = Some(now);
-        match target {
-            SidebarFocus::Session(name) => {
-                if rapid {
-                    self.arm_highlight_switch(name, now);
-                } else {
-                    self.pending_highlight_switch = None;
-                    self.switch_to_highlighted_session(name);
-                }
-            }
-            SidebarFocus::WorktreeGroup(_) => self.pending_highlight_switch = None,
+        // Highlight-driven switching: landing on a concrete session row sends
+        // the switch intent immediately; the server coalesces execution to at
+        // most one tmux switch per gate window with the latest intent winning,
+        // so scanning cannot strobe while single hops stay instant. Client-side
+        // debouncing was removed deliberately: a switch moves keyboard focus
+        // into the destination session's sidebar process, so per-process
+        // timers armed mid-scan outlive the user's presence in the pane and
+        // fire stale switches. Worktree group headers stay browse-only so
+        // collapse/expand remains reachable.
+        if let SidebarFocus::Session(name) = target {
+            self.switch_to_highlighted_session(name);
         }
     }
 
-    fn arm_highlight_switch(&mut self, name: String, now: Instant) {
-        if self.pending_switch_session.is_none()
-            && self.confirmed_local_session_name() == Some(name.as_str())
-        {
-            // Resting back on this client's confirmed row means "stay put":
-            // cancel any armed switch instead of scheduling a no-op.
-            self.pending_highlight_switch = None;
-            return;
-        }
-        self.pending_highlight_switch =
-            Some((name, now + Duration::from_millis(HIGHLIGHT_SWITCH_DEBOUNCE_MS)));
-    }
-
-    /// Queue a `SwitchSession` for a discretely highlighted session row.
+    /// Queue a `SwitchSession` for a keyboard-highlighted session row.
     ///
     /// Skips the command when the highlight is already on this client's
     /// confirmed session with no switch in flight, and when the same target
     /// is already the in-flight switch, so navigation stays idempotent.
     fn switch_to_highlighted_session(&mut self, name: String) {
-        if self.pending_switch_session.as_deref() == Some(name.as_str()) {
-            return;
-        }
-        if self.pending_switch_session.is_none()
-            && self.confirmed_local_session_name() == Some(name.as_str())
-        {
-            return;
-        }
-        self.request_session_switch(name, true);
-    }
-
-    /// Deadline of the armed highlight switch, if any. The event loop sleeps
-    /// until this instant and then calls [`Self::commit_highlight_switch`].
-    pub fn highlight_switch_deadline(&self) -> Option<Instant> {
-        self.pending_highlight_switch
-            .as_ref()
-            .map(|(_, deadline)| *deadline)
-    }
-
-    /// Commit the armed highlight switch: queue a `SwitchSession` for the row
-    /// the highlight rested on.
-    ///
-    /// Skips the command when the target vanished from the list, when it is
-    /// already the pending switch target, or when it is this client's
-    /// confirmed session with no switch in flight — so repeated navigation
-    /// stays idempotent while a reversed highlight (A -> B -> A) never sends
-    /// the intermediate switch at all.
-    pub fn commit_highlight_switch(&mut self) {
-        let Some((name, _)) = self.pending_highlight_switch.take() else {
-            return;
-        };
-        if !self.focus_exists(&SidebarFocus::Session(name.clone())) {
-            return;
-        }
         if self.pending_switch_session.as_deref() == Some(name.as_str()) {
             return;
         }
@@ -1142,9 +1069,6 @@ impl App {
     }
 
     fn request_session_switch(&mut self, name: String, preserve_focus: bool) {
-        // Any explicit switch (Enter, Tab, digits, clicks) supersedes an
-        // armed highlight debounce.
-        self.pending_highlight_switch = None;
         self.pending_switch_session = Some(name.clone());
         if preserve_focus {
             if let Some(focus) = self.visible_focus_for_session(&name) {
@@ -1744,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn discrete_highlight_onto_concrete_session_switches_immediately() {
+    fn highlight_onto_concrete_session_sends_switch_immediately() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
@@ -1758,22 +1682,18 @@ mod tests {
 
         assert_eq!(app.focused_session_name(), Some("beta"));
         assert_eq!(
-            app.highlight_switch_deadline(),
-            None,
-            "a discrete press must not pay the repeat debounce"
-        );
-        assert_eq!(
             app.drain_commands(),
             vec![ClientCommand::SwitchSession {
                 name: "beta".to_string(),
                 client_tty: None,
-            }]
+            }],
+            "highlight movement must send the switch intent without Enter"
         );
         assert_eq!(app.pending_switch_session.as_deref(), Some("beta"));
     }
 
     #[test]
-    fn keypress_right_after_session_activation_is_treated_as_mid_scan() {
+    fn every_highlight_hop_sends_its_switch_intent() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
@@ -1781,23 +1701,26 @@ mod tests {
             session("gamma", "/tmp/gamma", false),
         ];
         let mut app = App::from_state(state);
-        app.set_pane_identity("%1".to_string(), "beta".to_string(), None);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
-        // Key-repeat walking across sessions hops sidebar processes; the
-        // ActivateSession broadcast seeds this fresh sidebar's movement
-        // clock, so the repeat that lands here right afterwards must arm the
-        // debounce instead of firing another immediate switch.
-        app.apply_server_message(ServerMessage::ActivateSession {
-            name: "beta".to_string(),
-            source_pane_id: Some("%9".to_string()),
-        });
+        // The server-side gate coalesces execution; the client reports every
+        // intent so the latest one is available to win.
+        app.move_focus(1);
         app.move_focus(1);
 
-        assert!(
-            app.highlight_switch_deadline().is_some(),
-            "movement right after activation must debounce, not switch"
+        assert_eq!(
+            app.drain_commands(),
+            vec![
+                ClientCommand::SwitchSession {
+                    name: "beta".to_string(),
+                    client_tty: None,
+                },
+                ClientCommand::SwitchSession {
+                    name: "gamma".to_string(),
+                    client_tty: None,
+                },
+            ]
         );
-        assert_eq!(app.drain_commands(), Vec::new());
     }
 
     #[test]
@@ -1814,8 +1737,6 @@ mod tests {
         app.move_focus(1);
 
         assert_eq!(app.focused_group_key(), Some("/repo/worktrees"));
-        assert_eq!(app.highlight_switch_deadline(), None);
-        app.commit_highlight_switch();
         assert_eq!(app.drain_commands(), Vec::new());
         assert_eq!(app.pending_switch_session, None);
     }
@@ -1840,7 +1761,7 @@ mod tests {
                 name: "gamma".to_string(),
                 client_tty: None,
             }],
-            "wrapping onto a concrete row via a discrete press must switch"
+            "wrapping onto a concrete row must switch"
         );
     }
 
@@ -1860,12 +1781,10 @@ mod tests {
 
         assert_eq!(app.focused_session_name(), Some("alpha"));
         assert_eq!(
-            app.highlight_switch_deadline(),
-            None,
-            "wrapping back onto the confirmed row must disarm the debounce"
+            app.drain_commands(),
+            Vec::new(),
+            "wrapping back onto the confirmed row must not re-switch"
         );
-        app.commit_highlight_switch();
-        assert_eq!(app.drain_commands(), Vec::new());
     }
 
     #[test]
@@ -1879,80 +1798,11 @@ mod tests {
         app.move_focus(-1);
 
         assert_eq!(app.focused_session_name(), Some("alpha"));
-        assert_eq!(app.highlight_switch_deadline(), None);
         assert_eq!(app.drain_commands(), Vec::new());
     }
 
     #[test]
-    fn reversed_rapid_highlight_makes_the_confirmed_row_win() {
-        let mut state = empty_state(10);
-        state.sessions = vec![
-            session("alpha", "/tmp/alpha", false),
-            session("beta", "/tmp/beta", false),
-        ];
-        let mut app = App::from_state(state);
-        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
-
-        // Discrete press switches to beta immediately; the rapid reversal
-        // arms alpha (a switch is in flight) and the commit sends it, so the
-        // final highlighted row always wins.
-        app.move_focus(1);
-        app.move_focus(-1);
-        assert!(app.highlight_switch_deadline().is_some());
-        app.commit_highlight_switch();
-
-        assert_eq!(
-            app.drain_commands(),
-            vec![
-                ClientCommand::SwitchSession {
-                    name: "beta".to_string(),
-                    client_tty: None,
-                },
-                ClientCommand::SwitchSession {
-                    name: "alpha".to_string(),
-                    client_tty: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn rapid_browsing_coalesces_crossed_rows_into_the_resting_row() {
-        let mut state = empty_state(10);
-        state.sessions = vec![
-            session("alpha", "/tmp/alpha", false),
-            session("beta", "/tmp/beta", false),
-            session("gamma", "/tmp/gamma", false),
-            session("delta", "/tmp/delta", false),
-        ];
-        let mut app = App::from_state(state);
-        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
-
-        // First press of the burst is discrete and switches to beta; the
-        // rapid repeats cross gamma without switching and rest on delta.
-        app.move_focus(1);
-        app.move_focus(1);
-        app.move_focus(1);
-        app.commit_highlight_switch();
-
-        assert_eq!(
-            app.drain_commands(),
-            vec![
-                ClientCommand::SwitchSession {
-                    name: "beta".to_string(),
-                    client_tty: None,
-                },
-                ClientCommand::SwitchSession {
-                    name: "delta".to_string(),
-                    client_tty: None,
-                },
-            ],
-            "rows crossed during key repeat must not produce switches"
-        );
-    }
-
-    #[test]
-    fn commit_skips_when_target_is_already_the_pending_switch() {
+    fn rehighlighting_the_in_flight_switch_target_sends_nothing() {
         let mut state = empty_state(10);
         state.sessions = vec![
             session("alpha", "/tmp/alpha", false),
@@ -1962,50 +1812,15 @@ mod tests {
         app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
 
         app.move_focus(1);
-        assert_eq!(app.drain_commands().len(), 1, "discrete press switches");
+        assert_eq!(app.drain_commands().len(), 1, "first hop switches");
 
-        app.move_focus(-1);
+        app.set_focused_session("alpha");
         app.move_focus(1);
-        app.commit_highlight_switch();
 
         assert_eq!(
             app.drain_commands(),
             Vec::new(),
             "re-highlighting the in-flight switch target must stay idempotent"
         );
-    }
-
-    #[test]
-    fn enter_supersedes_armed_highlight_debounce() {
-        let mut state = empty_state(10);
-        state.sessions = vec![
-            session("alpha", "/tmp/alpha", false),
-            session("beta", "/tmp/beta", false),
-            session("gamma", "/tmp/gamma", false),
-        ];
-        let mut app = App::from_state(state);
-        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
-
-        app.move_focus(1);
-        app.move_focus(1);
-        assert!(app.highlight_switch_deadline().is_some());
-        app.activate_focused_item();
-
-        assert_eq!(
-            app.drain_commands(),
-            vec![
-                ClientCommand::SwitchSession {
-                    name: "beta".to_string(),
-                    client_tty: None,
-                },
-                ClientCommand::SwitchSession {
-                    name: "gamma".to_string(),
-                    client_tty: None,
-                },
-            ]
-        );
-        assert_eq!(app.highlight_switch_deadline(), None);
-        app.commit_highlight_switch();
-        assert_eq!(app.drain_commands(), Vec::new());
     }
 }

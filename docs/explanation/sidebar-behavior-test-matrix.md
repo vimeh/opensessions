@@ -8,7 +8,7 @@ The intended test surface is product E2E only: each test creates real fake git r
 
 | Behavior | E2E coverage |
 | --- | --- |
-| Highlighting a concrete session with `j`/`k`/arrows switches without `Enter` (immediately on a discrete press, after a short rest during key-repeat), the confirmed local session is not re-switched, worktree group headers stay browse-only with `Enter` toggling collapse, and group focus rehomes to the chosen child session. | `tmux_sidebar_keyboard_focus_and_worktree_flow` |
+| Highlighting a concrete session with `j`/`k`/arrows switches without `Enter` (execution coalesced by the server-side switch gate, latest intent wins), the confirmed local session is not re-switched, worktree group headers stay browse-only with `Enter` toggling collapse, and group focus rehomes to the chosen child session. | `tmux_sidebar_keyboard_focus_and_worktree_flow` |
 | A single `Down` switches the attached client, and returning to the origin session leaves every one of its sidebars showing the confirmed active row with no stale focus marker. | `tmux_sidebar_rehomes_focus_after_highlight_driven_switch` |
 | Explicit foreground sidebar resize persists once and fans out to every managed sidebar pane in the tmux server. | `tmux_sidebar_width_resize_fans_out_to_every_session_sidebar` |
 | `q` in a connected sidebar shuts down the server and every connected sidebar client. | `tmux_sidebar_quit_closes_the_server_and_every_sidebar_client` |

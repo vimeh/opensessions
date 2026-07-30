@@ -70,6 +70,11 @@ const SIDEBAR_WARMUP_MS: u64 = 1_200;
 /// client-session-changed and after-select-window back to back) would still
 /// scan "no sidebar here" and stack a duplicate.
 const SIDEBAR_ENSURE_RESPAWN_GUARD_MS: u64 = 2_000;
+/// Minimum spacing between executed tmux session switches. Sidebars send
+/// switch intents immediately on every highlight movement; the gate executes
+/// at most one switch per window and the latest intent wins, so key-repeat
+/// scanning cannot strobe the tmux client while a single press stays instant.
+const SWITCH_GATE_MS: u64 = 150;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
@@ -176,6 +181,24 @@ pub trait StateSource: Send + Sync + 'static {
         None
     }
 
+    /// Admit a switch-session intent through the switch gate.
+    fn admit_switch_session(&self, _name: String, _client_tty: Option<String>) -> SwitchAdmission {
+        SwitchAdmission::ExecuteNow
+    }
+
+    /// Take the coalesced pending switch intent, if any.
+    fn take_pending_switch(&self) -> Option<(String, Option<String>)> {
+        None
+    }
+
+    /// Returns true when the gate waker may exit (no pending intent).
+    fn try_disarm_switch_waker(&self) -> bool {
+        true
+    }
+
+    /// Execute a switch-session against the owning provider.
+    fn execute_switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+
     fn handle_agent_event_json(&self, _body: &Value) -> Result<String, AgentEventError> {
         Err(AgentEventError::CouldNotResolveSession)
     }
@@ -199,6 +222,26 @@ pub struct ClientConnectionContext {
     pane_id: Option<String>,
     session_name: Option<String>,
     window_id: Option<String>,
+}
+
+/// Outcome of admitting a switch intent through the switch gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchAdmission {
+    /// No switch executed within the gate window: execute this one now.
+    ExecuteNow,
+    /// Coalesced behind the gate; `spawn_waker` is true for the intent that
+    /// must start the waker task draining pending switches.
+    Deferred { spawn_waker: bool },
+}
+
+#[derive(Default)]
+struct SwitchGate {
+    /// `now_ms` of the most recently admitted-for-execution switch.
+    last_admitted_ms: Option<u64>,
+    /// Latest coalesced intent, replacing any earlier one.
+    pending: Option<(String, Option<String>)>,
+    /// Whether a waker task currently owns draining `pending`.
+    waker_armed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +414,7 @@ pub struct ReadOnlyMuxStateSource {
     agent_tracker: Mutex<AgentTracker>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     recent_ensure_spawns: parking_lot::Mutex<HashMap<String, u64>>,
+    switch_gate: parking_lot::Mutex<SwitchGate>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -420,6 +464,7 @@ impl ReadOnlyMuxStateSource {
             agent_tracker: Mutex::new(AgentTracker::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             recent_ensure_spawns: parking_lot::Mutex::new(HashMap::new()),
+            switch_gate: parking_lot::Mutex::new(SwitchGate::default()),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -608,6 +653,52 @@ impl ReadOnlyMuxStateSource {
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
+    fn admit_switch_session(&self, name: String, client_tty: Option<String>) -> SwitchAdmission {
+        let mut gate = self.switch_gate.lock();
+        let now = (self.now_ms)();
+        let gate_open = !gate.waker_armed
+            && gate
+                .last_admitted_ms
+                .is_none_or(|last| now.saturating_sub(last) >= SWITCH_GATE_MS);
+        if gate_open {
+            gate.last_admitted_ms = Some(now);
+            return SwitchAdmission::ExecuteNow;
+        }
+        gate.pending = Some((name, client_tty));
+        let spawn_waker = !gate.waker_armed;
+        gate.waker_armed = true;
+        SwitchAdmission::Deferred { spawn_waker }
+    }
+
+    fn take_pending_switch(&self) -> Option<(String, Option<String>)> {
+        let mut gate = self.switch_gate.lock();
+        let pending = gate.pending.take()?;
+        gate.last_admitted_ms = Some((self.now_ms)());
+        Some(pending)
+    }
+
+    fn try_disarm_switch_waker(&self) -> bool {
+        let mut gate = self.switch_gate.lock();
+        if gate.pending.is_some() {
+            return false;
+        }
+        gate.waker_armed = false;
+        true
+    }
+
+    fn execute_switch_session(&self, name: &str, client_tty: Option<&str>) {
+        let started = std::time::Instant::now();
+        let Some(provider) = self.provider_for_session(name) else {
+            return;
+        };
+        let resolve_ms = started.elapsed().as_millis();
+        provider.switch_session(name, client_tty);
+        debug_log(format!(
+            "switch-session name={name} resolve={resolve_ms}ms total={}ms",
+            started.elapsed().as_millis(),
+        ));
+    }
+
     fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
         let width = self.current_sidebar_width_u16();
         for provider in &self.providers {
@@ -760,14 +851,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                let started = std::time::Instant::now();
-                let provider = self.provider_for_session(name)?;
-                let resolve_ms = started.elapsed().as_millis();
-                provider.switch_session(name, client_tty);
-                debug_log(format!(
-                    "switch-session name={name} resolve={resolve_ms}ms total={}ms",
-                    started.elapsed().as_millis(),
-                ));
+                self.execute_switch_session(name, client_tty);
                 None
             }
             "switch-index" => {
@@ -2575,6 +2659,23 @@ fn request_shutdown(
     let _ = shutdown.send(());
 }
 
+/// Drain coalesced switch intents: execute the latest pending switch once per
+/// gate window until none remain, then disarm. Spawned by the first deferred
+/// intent; `try_disarm_switch_waker` closes the race where a new intent lands
+/// between the final take and the disarm.
+async fn run_switch_gate_waker(source: Arc<dyn StateSource>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(SWITCH_GATE_MS)).await;
+        if let Some((name, client_tty)) = source.take_pending_switch() {
+            source.execute_switch_session(&name, client_tty.as_deref());
+            continue;
+        }
+        if source.try_disarm_switch_waker() {
+            return;
+        }
+    }
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     shutdown: broadcast::Sender<()>,
@@ -2860,12 +2961,38 @@ async fn handle_connection(
                                 }
                                 if let Some(name) = switch_session_target(&command) {
                                     let _ = state_updates.send(activate_session_json(
-                                        name,
+                                        name.clone(),
                                         client_context.pane_id.as_deref(),
                                     ));
                                     tokio::task::yield_now().await;
-                                }
-                                if let Some(payload) = state_source
+                                    // Switch execution goes through the gate
+                                    // instead of the generic command handler:
+                                    // at most one tmux switch per gate window,
+                                    // latest intent wins.
+                                    if let Some(source) = state_source.as_ref() {
+                                        let client_tty = command
+                                            .get("clientTty")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string)
+                                            .or_else(|| client_context.client_tty.clone());
+                                        match source
+                                            .admit_switch_session(name.clone(), client_tty.clone())
+                                        {
+                                            SwitchAdmission::ExecuteNow => {
+                                                source.execute_switch_session(
+                                                    &name,
+                                                    client_tty.as_deref(),
+                                                );
+                                            }
+                                            SwitchAdmission::Deferred { spawn_waker: true } => {
+                                                tokio::spawn(run_switch_gate_waker(Arc::clone(
+                                                    source,
+                                                )));
+                                            }
+                                            SwitchAdmission::Deferred { spawn_waker: false } => {}
+                                        }
+                                    }
+                                } else if let Some(payload) = state_source
                                     .as_ref()
                                     .and_then(|state_source| state_source.handle_client_command_with_context(&command, Some(&client_context)))
                                 {
@@ -3346,6 +3473,48 @@ mod tests {
         // A different window is unaffected by the guard.
         assert!(source.ensure_sidebar("/dev/pts/0|nixos-config|@60|%12|1"));
         assert_eq!(provider.spawned.lock().len(), 2);
+    }
+
+    #[test]
+    fn switch_gate_executes_first_intent_and_coalesces_rapid_followers() {
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(10_000));
+        let tick = Arc::clone(&clock);
+        let provider = FakeProvider::new("tmux", vec!["a", "b", "c"]);
+        let source = source_with(vec![provider.clone()])
+            .with_now_ms(move || tick.load(std::sync::atomic::Ordering::SeqCst));
+
+        assert_eq!(
+            source.admit_switch_session("a".to_string(), None),
+            SwitchAdmission::ExecuteNow,
+            "the first intent must execute without gate latency"
+        );
+        assert_eq!(
+            source.admit_switch_session("b".to_string(), None),
+            SwitchAdmission::Deferred { spawn_waker: true },
+        );
+        assert_eq!(
+            source.admit_switch_session("c".to_string(), None),
+            SwitchAdmission::Deferred { spawn_waker: false },
+        );
+
+        assert!(
+            !source.try_disarm_switch_waker(),
+            "waker must keep draining while an intent is pending"
+        );
+        assert_eq!(
+            source.take_pending_switch(),
+            Some(("c".to_string(), None)),
+            "the latest coalesced intent wins"
+        );
+        assert_eq!(source.take_pending_switch(), None);
+        assert!(source.try_disarm_switch_waker());
+
+        clock.fetch_add(SWITCH_GATE_MS, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            source.admit_switch_session("b".to_string(), None),
+            SwitchAdmission::ExecuteNow,
+            "an intent after the gate window must execute immediately"
+        );
     }
 
     #[test]
