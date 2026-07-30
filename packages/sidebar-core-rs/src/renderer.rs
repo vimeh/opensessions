@@ -3047,6 +3047,7 @@ mod tests {
                 ClientCommand::SwitchSession {
                     name: "opensessions".to_string(),
                     client_tty: None,
+                    focus_main: false,
                 },
                 ClientCommand::FocusAgentPane {
                     session: "opensessions".to_string(),

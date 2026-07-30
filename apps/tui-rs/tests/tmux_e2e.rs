@@ -110,6 +110,14 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
             .is_some_and(|row| row.trim_start().starts_with("›")),
         "worktree group header must not remain focused after switching to concrete child; got:\n{destination}",
     );
+
+    // Highlight-driven switching must leave keyboard focus on the
+    // destination sidebar so navigation continues; Enter commits into the
+    // session's main pane.
+    lab.wait_for_active_pane(&worktree_dest);
+    lab.tmux_ok(["send-keys", "-t", worktree_dest.as_str(), "Enter"]);
+    let preview_main = lab.main_pane("os-demo-preview");
+    lab.wait_for_active_pane(&preview_main);
 }
 
 #[test]
@@ -1851,6 +1859,27 @@ time.sleep(300)
 
     fn active_pane(&self) -> String {
         self.tmux(["display-message", "-p", "#{pane_id}"])
+    }
+
+    fn wait_for_active_pane(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.active_pane() == expected {
+                return;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for active pane {expected}; active={} panes:\n{}\nlogs:\n{}",
+            self.active_pane(),
+            self.tmux([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name} #{window_id} #{pane_id} active=#{pane_active} title=#{pane_title}"
+            ]),
+            self.logs(),
+        );
     }
 
     fn current_window_index(&self, session: &str) -> String {

@@ -145,6 +145,11 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn focus_pane(&self, _pane_id: &str) {}
+
+    /// Focus a pane of the current window: the sidebar pane when `sidebar`
+    /// is true, else the first non-sidebar (main) pane. No-op when the
+    /// requested kind is already focused or cannot be found.
+    fn focus_current_window_pane(&self, _sidebar: bool) {}
     fn kill_pane(&self, _pane_id: &str) {}
 
     fn get_all_pane_counts(&self) -> HashMap<String, u32> {

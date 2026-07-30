@@ -622,7 +622,7 @@ impl App {
         {
             return;
         }
-        self.request_session_switch(name, true);
+        self.request_session_switch(name, true, false);
     }
 
     pub fn session_scroll_offset(&self) -> usize {
@@ -731,7 +731,10 @@ impl App {
 
     pub fn activate_focused_session(&mut self) {
         if let Some(name) = self.focused_session_name().map(str::to_string) {
-            self.request_session_switch(name, true);
+            // Enter commits: switch (a no-op when already there) and drop
+            // keyboard focus into the destination's main pane, leaving the
+            // sidebar. Plain highlight navigation keeps focus on the sidebar.
+            self.request_session_switch(name, true, true);
         }
     }
 
@@ -999,6 +1002,7 @@ impl App {
         self.commands.push(ClientCommand::SwitchSession {
             name: target.session.clone(),
             client_tty: None,
+            focus_main: false,
         });
         self.commands.push(ClientCommand::FocusAgentPane {
             session: target.session,
@@ -1065,10 +1069,10 @@ impl App {
     }
 
     fn switch_to_session(&mut self, name: String) {
-        self.request_session_switch(name, false);
+        self.request_session_switch(name, false, false);
     }
 
-    fn request_session_switch(&mut self, name: String, preserve_focus: bool) {
+    fn request_session_switch(&mut self, name: String, preserve_focus: bool, focus_main: bool) {
         self.pending_switch_session = Some(name.clone());
         if preserve_focus {
             if let Some(focus) = self.visible_focus_for_session(&name) {
@@ -1082,6 +1086,7 @@ impl App {
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
+            focus_main,
         });
     }
 
@@ -1180,7 +1185,7 @@ impl App {
             self.rehome_focus_to_local_session();
             return;
         }
-        self.request_session_switch(names[next_idx].clone(), false);
+        self.request_session_switch(names[next_idx].clone(), false, false);
     }
 
     fn session_focus_targets(&self) -> Vec<SidebarFocus> {
@@ -1686,6 +1691,7 @@ mod tests {
             vec![ClientCommand::SwitchSession {
                 name: "beta".to_string(),
                 client_tty: None,
+                focus_main: false,
             }],
             "highlight movement must send the switch intent without Enter"
         );
@@ -1714,10 +1720,12 @@ mod tests {
                 ClientCommand::SwitchSession {
                     name: "beta".to_string(),
                     client_tty: None,
+                    focus_main: false,
                 },
                 ClientCommand::SwitchSession {
                     name: "gamma".to_string(),
                     client_tty: None,
+                    focus_main: false,
                 },
             ]
         );
@@ -1760,6 +1768,7 @@ mod tests {
             vec![ClientCommand::SwitchSession {
                 name: "gamma".to_string(),
                 client_tty: None,
+                focus_main: false,
             }],
             "wrapping onto a concrete row must switch"
         );
@@ -1821,6 +1830,32 @@ mod tests {
             app.drain_commands(),
             Vec::new(),
             "re-highlighting the in-flight switch target must stay idempotent"
+        );
+    }
+
+    #[test]
+    fn enter_commits_the_highlighted_session_with_main_pane_focus() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "alpha".to_string(), None);
+
+        app.move_focus(1);
+        app.drain_commands();
+
+        app.activate_focused_item();
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "beta".to_string(),
+                client_tty: None,
+                focus_main: true,
+            }],
+            "Enter must commit into the session's main pane"
         );
     }
 }

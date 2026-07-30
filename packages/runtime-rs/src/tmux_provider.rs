@@ -853,6 +853,26 @@ impl MuxProvider for TmuxProvider {
         self.client.flash_pane(pane_id);
     }
 
+    fn focus_current_window_pane(&self, sidebar: bool) {
+        let window_id = self.client.display("#{window_id}", None);
+        if window_id.is_empty() {
+            return;
+        }
+        let panes = self.client.list_panes(PaneScope::Window(&window_id));
+        let already_focused = panes
+            .iter()
+            .any(|pane| pane.active && (pane.title == "opensessions-sidebar") == sidebar);
+        if already_focused {
+            return;
+        }
+        let target = panes
+            .iter()
+            .find(|pane| (pane.title == "opensessions-sidebar") == sidebar);
+        if let Some(pane) = target {
+            self.client.select_pane(&pane.id);
+        }
+    }
+
     fn kill_pane(&self, pane_id: &str) {
         self.client.kill_pane(pane_id);
     }

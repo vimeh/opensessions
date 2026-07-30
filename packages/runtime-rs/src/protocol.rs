@@ -248,6 +248,11 @@ pub enum ClientCommand {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
+        /// Focus the destination's main (non-sidebar) pane after switching.
+        /// Default keeps keyboard focus on the destination sidebar so
+        /// navigation continues until the user explicitly commits (Enter).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        focus_main: bool,
     },
     NewSession,
     HideSession {

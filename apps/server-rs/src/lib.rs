@@ -182,12 +182,17 @@ pub trait StateSource: Send + Sync + 'static {
     }
 
     /// Admit a switch-session intent through the switch gate.
-    fn admit_switch_session(&self, _name: String, _client_tty: Option<String>) -> SwitchAdmission {
+    fn admit_switch_session(
+        &self,
+        _name: String,
+        _client_tty: Option<String>,
+        _focus_main: bool,
+    ) -> SwitchAdmission {
         SwitchAdmission::ExecuteNow
     }
 
     /// Take the coalesced pending switch intent, if any.
-    fn take_pending_switch(&self) -> Option<(String, Option<String>)> {
+    fn take_pending_switch(&self) -> Option<PendingSwitch> {
         None
     }
 
@@ -197,7 +202,7 @@ pub trait StateSource: Send + Sync + 'static {
     }
 
     /// Execute a switch-session against the owning provider.
-    fn execute_switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+    fn execute_switch_session(&self, _name: &str, _client_tty: Option<&str>, _focus_main: bool) {}
 
     fn handle_agent_event_json(&self, _body: &Value) -> Result<String, AgentEventError> {
         Err(AgentEventError::CouldNotResolveSession)
@@ -224,6 +229,14 @@ pub struct ClientConnectionContext {
     window_id: Option<String>,
 }
 
+/// A coalesced switch intent waiting behind the switch gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSwitch {
+    pub name: String,
+    pub client_tty: Option<String>,
+    pub focus_main: bool,
+}
+
 /// Outcome of admitting a switch intent through the switch gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwitchAdmission {
@@ -239,7 +252,7 @@ struct SwitchGate {
     /// `now_ms` of the most recently admitted-for-execution switch.
     last_admitted_ms: Option<u64>,
     /// Latest coalesced intent, replacing any earlier one.
-    pending: Option<(String, Option<String>)>,
+    pending: Option<PendingSwitch>,
     /// Whether a waker task currently owns draining `pending`.
     waker_armed: bool,
 }
@@ -653,7 +666,12 @@ impl ReadOnlyMuxStateSource {
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
-    fn admit_switch_session(&self, name: String, client_tty: Option<String>) -> SwitchAdmission {
+    fn admit_switch_session(
+        &self,
+        name: String,
+        client_tty: Option<String>,
+        focus_main: bool,
+    ) -> SwitchAdmission {
         let mut gate = self.switch_gate.lock();
         let now = (self.now_ms)();
         let gate_open = !gate.waker_armed
@@ -664,13 +682,17 @@ impl StateSource for ReadOnlyMuxStateSource {
             gate.last_admitted_ms = Some(now);
             return SwitchAdmission::ExecuteNow;
         }
-        gate.pending = Some((name, client_tty));
+        gate.pending = Some(PendingSwitch {
+            name,
+            client_tty,
+            focus_main,
+        });
         let spawn_waker = !gate.waker_armed;
         gate.waker_armed = true;
         SwitchAdmission::Deferred { spawn_waker }
     }
 
-    fn take_pending_switch(&self) -> Option<(String, Option<String>)> {
+    fn take_pending_switch(&self) -> Option<PendingSwitch> {
         let mut gate = self.switch_gate.lock();
         let pending = gate.pending.take()?;
         gate.last_admitted_ms = Some((self.now_ms)());
@@ -686,15 +708,22 @@ impl StateSource for ReadOnlyMuxStateSource {
         true
     }
 
-    fn execute_switch_session(&self, name: &str, client_tty: Option<&str>) {
+    fn execute_switch_session(&self, name: &str, client_tty: Option<&str>, focus_main: bool) {
         let started = std::time::Instant::now();
         let Some(provider) = self.provider_for_session(name) else {
             return;
         };
         let resolve_ms = started.elapsed().as_millis();
         provider.switch_session(name, client_tty);
+        // Sidebar-originated switches keep keyboard focus on the destination
+        // sidebar so navigation continues; Enter commits into the main pane.
+        for provider in &self.providers {
+            if provider.is_full_sidebar_capable() {
+                provider.focus_current_window_pane(!focus_main);
+            }
+        }
         debug_log(format!(
-            "switch-session name={name} resolve={resolve_ms}ms total={}ms",
+            "switch-session name={name} focus_main={focus_main} resolve={resolve_ms}ms total={}ms",
             started.elapsed().as_millis(),
         ));
     }
@@ -851,7 +880,11 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                self.execute_switch_session(name, client_tty);
+                let focus_main = command
+                    .get("focusMain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.execute_switch_session(name, client_tty, focus_main);
                 None
             }
             "switch-index" => {
@@ -2666,8 +2699,12 @@ fn request_shutdown(
 async fn run_switch_gate_waker(source: Arc<dyn StateSource>) {
     loop {
         tokio::time::sleep(Duration::from_millis(SWITCH_GATE_MS)).await;
-        if let Some((name, client_tty)) = source.take_pending_switch() {
-            source.execute_switch_session(&name, client_tty.as_deref());
+        if let Some(pending) = source.take_pending_switch() {
+            source.execute_switch_session(
+                &pending.name,
+                pending.client_tty.as_deref(),
+                pending.focus_main,
+            );
             continue;
         }
         if source.try_disarm_switch_waker() {
@@ -2975,13 +3012,20 @@ async fn handle_connection(
                                             .and_then(Value::as_str)
                                             .map(str::to_string)
                                             .or_else(|| client_context.client_tty.clone());
-                                        match source
-                                            .admit_switch_session(name.clone(), client_tty.clone())
-                                        {
+                                        let focus_main = command
+                                            .get("focusMain")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        match source.admit_switch_session(
+                                            name.clone(),
+                                            client_tty.clone(),
+                                            focus_main,
+                                        ) {
                                             SwitchAdmission::ExecuteNow => {
                                                 source.execute_switch_session(
                                                     &name,
                                                     client_tty.as_deref(),
+                                                    focus_main,
                                                 );
                                             }
                                             SwitchAdmission::Deferred { spawn_waker: true } => {
@@ -3484,16 +3528,16 @@ mod tests {
             .with_now_ms(move || tick.load(std::sync::atomic::Ordering::SeqCst));
 
         assert_eq!(
-            source.admit_switch_session("a".to_string(), None),
+            source.admit_switch_session("a".to_string(), None, false),
             SwitchAdmission::ExecuteNow,
             "the first intent must execute without gate latency"
         );
         assert_eq!(
-            source.admit_switch_session("b".to_string(), None),
+            source.admit_switch_session("b".to_string(), None, false),
             SwitchAdmission::Deferred { spawn_waker: true },
         );
         assert_eq!(
-            source.admit_switch_session("c".to_string(), None),
+            source.admit_switch_session("c".to_string(), None, true),
             SwitchAdmission::Deferred { spawn_waker: false },
         );
 
@@ -3503,15 +3547,19 @@ mod tests {
         );
         assert_eq!(
             source.take_pending_switch(),
-            Some(("c".to_string(), None)),
-            "the latest coalesced intent wins"
+            Some(PendingSwitch {
+                name: "c".to_string(),
+                client_tty: None,
+                focus_main: true,
+            }),
+            "the latest coalesced intent wins, carrying its focus flag"
         );
         assert_eq!(source.take_pending_switch(), None);
         assert!(source.try_disarm_switch_waker());
 
         clock.fetch_add(SWITCH_GATE_MS, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            source.admit_switch_session("b".to_string(), None),
+            source.admit_switch_session("b".to_string(), None, false),
             SwitchAdmission::ExecuteNow,
             "an intent after the gate window must execute immediately"
         );
