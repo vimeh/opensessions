@@ -287,6 +287,13 @@ impl App {
                 name,
                 source_pane_id,
             } => {
+                // A switch just happened somewhere in this tmux server. Seed
+                // the focus-movement clock so a keypress landing here within
+                // the debounce window counts as mid-scan (key-repeat walking
+                // across sessions hops sidebar processes, and each fresh
+                // sidebar would otherwise treat its first repeat as a
+                // discrete press and switch immediately — a switch per row).
+                self.last_focus_move_at = Some(Instant::now());
                 let previous_activated = self.last_activated_session.replace(name.clone());
                 let from_this_pane = self
                     .pane_identity
@@ -1763,6 +1770,34 @@ mod tests {
             }]
         );
         assert_eq!(app.pending_switch_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn keypress_right_after_session_activation_is_treated_as_mid_scan() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("alpha", "/tmp/alpha", false),
+            session("beta", "/tmp/beta", false),
+            session("gamma", "/tmp/gamma", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "beta".to_string(), None);
+
+        // Key-repeat walking across sessions hops sidebar processes; the
+        // ActivateSession broadcast seeds this fresh sidebar's movement
+        // clock, so the repeat that lands here right afterwards must arm the
+        // debounce instead of firing another immediate switch.
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "beta".to_string(),
+            source_pane_id: Some("%9".to_string()),
+        });
+        app.move_focus(1);
+
+        assert!(
+            app.highlight_switch_deadline().is_some(),
+            "movement right after activation must debounce, not switch"
+        );
+        assert_eq!(app.drain_commands(), Vec::new());
     }
 
     #[test]
