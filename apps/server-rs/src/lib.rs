@@ -101,29 +101,14 @@ impl ShutdownAnnouncement {
     }
 }
 
-/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
-/// so live focus/agent-state issues can be diagnosed without extra env setup;
-/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
+/// Append a single debug line to the shared capped log (see
+/// `opensessions_runtime::debug_log`). `OPENSESSIONS_DEBUG_LOG` overrides
+/// the path; an empty value disables logging.
 fn debug_log(line: impl AsRef<str>) {
-    use std::io::Write;
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .ok()
-        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
-    if path.is_empty() {
-        return;
-    }
-    let now = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            file,
-            "[{now}] [server pid={}] {}",
-            std::process::id(),
-            line.as_ref()
-        );
-    }
+    opensessions_runtime::debug_log::log_with_tag(
+        &format!("server pid={}", std::process::id()),
+        line,
+    );
 }
 
 pub trait StateSource: Send + Sync + 'static {
@@ -715,6 +700,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         };
         let resolve_ms = started.elapsed().as_millis();
         provider.switch_session(name, client_tty);
+        let switch_ms = started.elapsed().as_millis() - resolve_ms;
         // Sidebar-originated switches keep keyboard focus on the destination
         // sidebar so navigation continues; Enter commits into the main pane.
         for provider in &self.providers {
@@ -723,7 +709,8 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
         }
         debug_log(format!(
-            "switch-session name={name} focus_main={focus_main} resolve={resolve_ms}ms total={}ms",
+            "switch-session name={name} focus_main={focus_main} resolve={resolve_ms}ms \
+             switch={switch_ms}ms total={}ms",
             started.elapsed().as_millis(),
         ));
     }

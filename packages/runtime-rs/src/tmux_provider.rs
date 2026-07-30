@@ -400,6 +400,7 @@ impl TmuxClient {
         if (dest_width, dest_height) == (source_width, source_height) {
             return None;
         }
+        let started = std::time::Instant::now();
         self.run(&[
             "resize-window",
             "-t",
@@ -411,6 +412,7 @@ impl TmuxClient {
         ]);
         // The rescale redistributed pane widths; put the sidebar back before
         // the window becomes visible.
+        let mut sidebar_fixed = false;
         if let Some(width) = self.sidebar_width_option() {
             if let Some(sidebar) = self
                 .list_panes(PaneScope::Window(&dest_window))
@@ -419,9 +421,18 @@ impl TmuxClient {
             {
                 if sidebar.width != width {
                     self.resize_pane_width(&sidebar.id, width);
+                    sidebar_fixed = true;
                 }
             }
         }
+        crate::debug_log::log_with_tag(
+            "tmux-provider",
+            format!(
+                "presize-switch window={dest_window} {dest_width}x{dest_height} -> \
+                 {source_width}x{source_height} sidebar_fixed={sidebar_fixed} took={}ms",
+                started.elapsed().as_millis(),
+            ),
+        );
         Some(dest_window)
     }
 
